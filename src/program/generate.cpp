@@ -460,10 +460,11 @@ struct Options {
     /// to them.  Measured at 256 slots: **1781 of 60000 = 2.97%**, against **21.4%** for 8 slots per layer and
     /// **70.4%** for 64, from `Memory/cache_allocation.py` on the same run's routing.  Off by default.
     bool expert_cache_per_layer = false;
-    /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
-    /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
-    /// (-1 = adapt_swaps).
-    int peer_device = -1;
+    /// Multi-GPU: adaptive expert tiers on the CUDA devices in `peer_devices` (empty = off; the legacy
+    /// --peer-device N seeds a one-device list), `peer_reserve_mib` left free on each, `peer_slots` caps each
+    /// tier's size (0 = as many as fit), `peer_adapt_swaps` per adaptive round (-1 = adapt_swaps).
+    std::vector<int> peer_devices;
+    int peer_device = -1;          ///< the first peer device (legacy accessor; -1 = off)
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
@@ -840,6 +841,10 @@ void usage() {
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
+                  "  --peer-devices LIST  up to 3 tier GPUs, comma-separated (e.g. 1,2,3): the tiers are disjoint\n"
+                  "                       (each holds what the primary and the earlier ones do not) and each adapts\n"
+                  "                       beside the others' holdings.  The prompt share applies to a single\n"
+                  "                       --peer-device only; the same refusals as --peer-device apply.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
@@ -2002,6 +2007,17 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
+        else if (a == "--peer-devices") {
+            const std::string v = next("--peer-devices");
+            size_t p0 = 0;
+            while (p0 <= v.size()) {
+                const size_t c = v.find(',', p0);
+                const std::string tok = v.substr(p0, c == std::string::npos ? std::string::npos : c - p0);
+                if (!tok.empty()) o.peer_devices.push_back(std::atoi(tok.c_str()));
+                if (c == std::string::npos) break;
+                p0 = c + 1;
+            }
+        }
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
@@ -2077,14 +2093,24 @@ int main(int argc, char** argv) {
             if (const char* e = std::getenv("STRATA_HOST_CORE")) hc = e;
         if (hc == "last") strata::kernels::cpu::set_host_core(strata::kernels::cpu::HostCore::Last);
     }
-    strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
-    if (o.peer_device >= 1) {   // the peer's context must exist BEFORE the arena's whole-range cudaHostRegister
+    // multi-tier: --peer-device N is a one-device list; a list also sets the legacy accessor to its first device
+    if (o.peer_device >= 1 && o.peer_devices.empty()) o.peer_devices.push_back(o.peer_device);
+    if (o.peer_devices.size() > 3) {
+        std::fprintf(stderr, "strata generate: --peer-devices takes at most 3 devices (got %zu)\n",
+                     o.peer_devices.size());
+        return 2;
+    }
+    if (!o.peer_devices.empty()) o.peer_device = o.peer_devices.front();
+    strata::core::set_peer_portable(!o.peer_devices.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    if (!o.peer_devices.empty()) {   // the peer's context must exist BEFORE the arena's whole-range cudaHostRegister
         int n = -1;             // (#253's Linux default). Registered first, the peer's first device op — a
-        if (cudaGetDeviceCount(&n) == cudaSuccess && o.peer_device < n) {  // stream, in PeerExperts::open — fails
-            cudaSetDevice(o.peer_device);   // with a misleading 'out of memory' even on an empty card (the
-            cudaFree(0);                    // registration has to map into every context). Forced here, that
-            cudaSetDevice(0);               // mapping lands on the register itself, whose sliced-pin fallback
-        }                                   // (#243 / STRATA_ARENA_PIN_GIB) can already take over.
+        if (cudaGetDeviceCount(&n) == cudaSuccess)
+            for (const int dev : o.peer_devices) {   // stream, in PeerExperts::open — fails
+                if (dev < 1 || dev >= n) continue;   // with a misleading 'out of memory' even on an empty card (the
+                cudaSetDevice(dev);                  // registration has to map into every context). Forced here, that
+                cudaFree(0);                         // mapping lands on the register itself, whose sliced-pin fallback
+            }                                        // (#243 / STRATA_ARENA_PIN_GIB) can already take over.
+        cudaSetDevice(0);
     }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
@@ -2504,7 +2530,7 @@ int main(int argc, char** argv) {
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
     // part (and a second copy of the same experts) on it
-    if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
+    if (!o.peer_devices.empty() && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
         std::fprintf(stderr, "strata generate: --peer-device cannot be combined with %s\n",
                      !o.layer_split.empty() ? "--layer-split (use one or the other)"
                                             : "--expert-cache-device1..3 (the peer tier already caches experts there)");
@@ -3328,7 +3354,7 @@ int main(int argc, char** argv) {
                         : split_devs.size() != 1 ? "it needs a layer split into exactly two stages"
                         : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
                         : o.batch != 0 ? "not with --batch slots"
-                        : o.peer_device >= 1 ? "not with --peer-device"
+                        : !o.peer_devices.empty() ? "not with --peer-device"
                         : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
                         : nullptr;
         if (off != nullptr) {
@@ -3452,7 +3478,7 @@ int main(int argc, char** argv) {
         // STRATA_PEER_HOT_AT (default 8700, ~ the primary's slots) ranks, every pair with floor((r+1)f) > floor(rf)
         // moves to just after that point: the primary fills past them, the peer (which takes what the primary does
         // not hold, in order) gets them first.
-        if (o.peer_device >= 1) {   // default 0.45 (measured: 0.3-0.6 all better than 0; 0 = off, e.g. for the gate)
+        if (!o.peer_devices.empty()) {   // default 0.45 (measured: 0.3-0.6 all better than 0; 0 = off, e.g. for the gate)
             const char* ph = std::getenv("STRATA_PEER_HOT");
             const double f = ph ? std::atof(ph) : 0.45;
             const char* pa = std::getenv("STRATA_PEER_HOT_AT");
@@ -4104,7 +4130,7 @@ int main(int argc, char** argv) {
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
-                            o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
+                            o.batch == 0 && !o.vram_elastic && o.peer_devices.empty();
             if (asked && !on && (o.kv_grow_given || (ev != nullptr && ev[0] != '\0')))
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
@@ -5193,22 +5219,45 @@ int main(int argc, char** argv) {
     }
 
     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
-    strata::core::PeerExperts peer;
-    if (o.peer_device >= 1) {
+    // multi-tier: one PeerExperts per --peer-devices entry, opened in list order.  Each open takes the ranked
+    // pairs the primary does not hold, as many as fit; the list handed to the NEXT tier is filtered to exclude
+    // what this tier took, so the tiers are disjoint by construction (their adapts keep it so, below).
+    strata::core::PeerExperts peers[3];
+    int n_peers = 0;
+    auto any_peer_has = [&](int64_t l, int32_t e) -> bool {
+        for (int p = 0; p < n_peers; ++p) if (peers[p].has(l, e)) return true;
+        return false;
+    };
+    if (!o.peer_devices.empty()) {
         if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
             std::fprintf(stderr, "strata generate: --peer-device needs --expert-profile and the expert cache\n");
             return 1;
         }
-        const auto tp0 = Clock::now();
-        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
-                       err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        std::vector<std::pair<int32_t, int32_t>> cand = profile;
+        for (size_t pi = 0; pi < o.peer_devices.size(); ++pi) {
+            const auto tp0 = Clock::now();
+            if (!peers[n_peers].open(o.peer_devices[pi], cand, xcache, *srcp, g.n_layers, g.n_expert,
+                                     o.peer_reserve_mib, o.peer_slots, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s)\n",
+                         o.peer_devices[pi], (long long) peers[n_peers].resident(), peers[n_peers].gib(),
+                         std::chrono::duration<double>(Clock::now() - tp0).count());
+            if (pi + 1 < o.peer_devices.size()) {   // the next tier takes what this one did not
+                std::vector<std::pair<int32_t, int32_t>> next;
+                next.reserve(cand.size());
+                for (const auto& pr : cand)
+                    if (!peers[n_peers].has(pr.first, pr.second)) next.push_back(pr);
+                cand.swap(next);
+            }
+            ++n_peers;
         }
-        std::fprintf(stderr, "strata generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
-                             "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
-                     std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
-                     (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        int64_t tier_res = 0;
+        for (int p = 0; p < n_peers; ++p) tier_res += peers[p].resident();
+        std::fprintf(stderr, "strata generate: with the primary's %lld that is %lld of %lld on the GPUs\n",
+                     (long long) xcache.slots(), (long long) (tier_res + xcache.slots()),
+                     (long long) (g.n_layers * g.n_expert));
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
@@ -5225,7 +5274,8 @@ int main(int argc, char** argv) {
     };
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
-    drive.d.peer = peer.valid() ? &peer : nullptr;
+    for (int p = 0; p < n_peers; ++p) drive.d.peers[p] = &peers[p];
+    drive.d.n_peers = n_peers;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -6383,7 +6433,7 @@ int main(int argc, char** argv) {
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
                         : !o.resident_cpu_experts ? "it needs the resident RAM mode, --resident-experts"
                         : o.batch > 0 ? "not with --batch slots"
-                        : peer.valid() ? "not with --peer-device"
+                        : n_peers > 0 ? "not with --peer-device"
                         : remote_opt ? "not with --remote-expert-opt"
                         : o.pipeline_windows >= 2 && !pl_async ? "not with --pipeline-windows 2 (STRATA_PIPELINE_ADAPT_ASYNC=0)"
                         : nullptr;
@@ -6900,9 +6950,9 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
-        if (peer.valid() && o.peer_prefill_rows != 0) {
+        if (n_peers == 1 && o.peer_prefill_rows != 0) {   // the prompt share stays single-tier (multi-peer is P3)
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            if (!sp.set_peer(&peer, rows, err)) {
+            if (!sp.set_peer(&peers[0], rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                 err.clear();
             }
@@ -7696,7 +7746,7 @@ int main(int argc, char** argv) {
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // the serial windows of one GPU, where the pool can admit (expert_pool_dispatch_multi's fetch_on)
         const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
-                              : multi_gpu || !stages.empty() ? "a layer split" : peer.valid() ? "--peer-device"
+                              : multi_gpu || !stages.empty() ? "a layer split" : n_peers > 0 ? "--peer-device"
                               : remote_opt || drive.d.remote_count > 0 ? "helper GPUs" : o.adapt_async ? "--adapt-async"
                               : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch" : nullptr;
         if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
@@ -7752,7 +7802,7 @@ int main(int argc, char** argv) {
             return r;
         };
         auto apply_pending = [&](bool wait) {
-            if (peer.valid()) peer.apply_pending(wait);
+            for (int p = 0; p < n_peers; ++p) peers[p].apply_pending(wait);
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
@@ -8033,7 +8083,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !any_peer_has(l, e) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -8141,14 +8191,19 @@ int main(int argc, char** argv) {
             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
             // is empty
             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
-            if (peer.valid()) {                   // multi-GPU: the peer takes the next most-routed CPU misses
+            if (n_peers > 0) {                   // multi-GPU: each tier takes the next most-routed CPU misses
                 std::vector<int32_t> r0 = host_res;
                 for (const auto& [i, slot] : pending) r0[(size_t) i] = slot;   // swapped into the primary already
+                std::vector<int32_t> merged(r0.size());
                 std::string perr;
-                if (!peer.adapt(drive.d.usage.data(), r0.data(),
-                                o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
-                    std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
-                    return false;
+                for (int p = 0; p < n_peers; ++p) {
+                    merged = r0;                                                  // what the primary holds...
+                    for (int q = 0; q < n_peers; ++q) if (q != p) peers[q].fill_residency(merged.data());
+                    if (!peers[p].adapt(drive.d.usage.data(), merged.data(),     // ... plus the other tiers'
+                                        o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
+                        std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
+                        return false;
+                    }
                 }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
@@ -8762,7 +8817,7 @@ int main(int argc, char** argv) {
                 e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
                 return false;
             }
-            if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
+            if (n_peers > 0) { e = "VRAM: not with --peer-device"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
@@ -9331,7 +9386,7 @@ int main(int argc, char** argv) {
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
-                if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
+                if (!o.peer_devices.empty()) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
@@ -12152,7 +12207,7 @@ int main(int argc, char** argv) {
         const double fms0 = src.file_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
-                              : multi_gpu ? "a layer split" : drive.d.peer != nullptr ? "a peer tier"
+                              : multi_gpu ? "a layer split" : drive.d.n_peers > 0 ? "a peer tier"
                               : drive.d.remote_count > 0 ? "helper GPUs" : nullptr;
         if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
             const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off

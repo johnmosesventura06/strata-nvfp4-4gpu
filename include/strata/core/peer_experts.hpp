@@ -51,6 +51,14 @@ public:
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
 
+    /// multi-tier: OR this tier's residency into a caller's [n_layers * n_expert] table (entries the caller's
+    /// table already holds are left alone).  Used to merge the OTHER tiers' holdings into the primary's table
+    /// before a tier's `adapt`, so no expert ends up in two caches.
+    void fill_residency(int32_t* table) const {
+        for (size_t i = 0; i < res_.size(); ++i)
+            if (table[i] < 0 && res_[i] >= 0) table[i] = res_[i];
+    }
+
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
         const int32_t sl = res_[(size_t) (layer * n_expert_ + expert)];

@@ -545,9 +545,16 @@ struct ExpertDispatch {
     std::vector<std::pair<int64_t, int32_t>> fetch_log;   ///< (layer * n_expert + expert, slot)
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
-    /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
-    PeerExperts* peer = nullptr;
-    int64_t peer_entries = 0;      ///< routed entries the peer served in verify windows
+    /// Multi-GPU: the peer GPUs' adaptive expert tiers (up to 3, --peer-devices).  Their experts are computed
+    /// there instead of on the CPU (kind 2); an entry's tier is the FIRST peer whose cache holds it (peer_of),
+    /// the tiers being disjoint by construction (each open excludes the earlier ones, each adapt excludes the
+    /// others through the merged residency table).
+    PeerExperts* peers[3] = {};
+    int n_peers = 0;
+    int64_t peer_entries = 0;      ///< routed entries the tiers served in verify windows
+    /// the tier index holding (layer, expert), or -1 when no peer card does.  Defined in expert_source.cpp:
+    /// peer_experts.hpp includes this header, so the tier's `has` is not visible here.
+    int peer_of(int64_t layer, int32_t expert) const;
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.
