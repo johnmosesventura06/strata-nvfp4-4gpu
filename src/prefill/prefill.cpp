@@ -690,6 +690,7 @@ struct PeerPrefill {
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     bool nvfp4 = false;                   // P3a: the pack's experts carry a 16-byte FP32 tail {s_gate, s_up, s_down, 0}
     float* grp_tail = nullptr;            // P3a: the group's tails, MMQ_GROUP x 4 floats on this card
+    float *Xscale = nullptr, *Hscale = nullptr;   // P3a.1: the FP4 activations' row scales (w4a4x2's y_scale)
     std::unique_ptr<mmq::Context> ctx;
     mmq::Context* run_ctx = nullptr;      // the context its products run in: ctx, or a layer split helper stage's
     // Without P2P (a layer split's helper) the activations and the result rows go through MAPPED pinned host buffers: the device that needs them reads them with a copy kernel.  A copy-engine
@@ -1723,7 +1724,14 @@ std::unique_ptr<PeerPrefill> Prefill::make_pp(core::PeerExperts* peer, int64_t c
         return p;
     };
     pp->mixed = (float*) take((size_t) m.T_max * N * 4);
-    if (ok && pp->nvfp4) pp->grp_tail = (float*) take((size_t) MMQ_GROUP * 4 * sizeof(float));   // P3a
+    if (ok && pp->nvfp4) {
+        pp->grp_tail = (float*) take((size_t) MMQ_GROUP * 4 * sizeof(float));   // P3a
+        // P3a.1: w4a4x2 (the fork's default prompt mode) quantizes the ACTIVATIONS to NVFP4 too, and its
+        // products refuse to run without the row-scale buffer ("NVFP4 activations need a scale buffer").
+        // Sized like the primary's: one float per activation row, the rows each product reads.
+        pp->Xscale = (float*) take((size_t) m.T_max * K * sizeof(float));
+        pp->Hscale = (float*) take((size_t) m.T_max * K * sizeof(float));
+    }
     {
         const char* v = std::getenv("STRATA_PF_PEER_COMPACT");
         pp->compact = (v == nullptr || std::atoi(v) != 0) || !pp->p2p;   // the layer-sized path copies over P2P only
@@ -3293,14 +3301,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             own_blk.assign((size_t) m.g->n_expert, -1);
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c > 0 && !m.pp->ps_flag.empty() && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) {   // peer-streamed
+                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                                    continue;
+                                if (!on_cpu.empty() && on_cpu[(size_t) e]) continue;   // P3b: the CPU claimed it (its
+                                             // rows go in the CPU's block); the pre-P3b code let one expert sit in
+                                             // both, which double-counted its rows and overflowed the row tables
+                                if (!m.pp->ps_flag.empty() && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) {   // peer-streamed
                                     on_peer[(size_t) e] = 2;
                                     rows_str += c;
                                     rows_peer += c;
                                     continue;
                                 }
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
-                                    continue;
                                 for (int o = 0; o < npp; ++o) {   // P3b: the tier that holds it computes it (the tiers are disjoint)
                                     PeerPrefill* Q = m.pp_at(o);
                                     if (!Q->peer || !Q->peer->has(l, e)) continue;
@@ -3673,17 +3684,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int32_t* rel = P.bounds + n + 1 + g2 * (MMQ_GROUP + 1);
                                     cudaMemsetAsync(P.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, ps);
                                     cudaMemsetAsync(P.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, ps);
-                                    mmq::quantize(P.mixed, P.src + r0, P.Xq_g, mmq_gt, N, N, nr, ps);
+                                    mmq::quantize(P.mixed, P.src + r0, P.Xq_g, mmq_gt, N, N, nr, ps, P.Xscale);   // P3a.1
                                     mmq::Product gu;
                                     gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                     gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
                                     gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = 1280;
+                                    gu.y_scale = mmq::fp4_activations(mmq_gt) ? P.Xscale : nullptr;   // P3a.1
                                     P.run_ctx->run(gu, ps);
                                     if (f.tail_off)   // P3a: gate/up scales read as swiglu reads the halves
                                         mmq::swiglu_scaled(P.GU_g, P.H_g, nr, 640, rel, ngx, P.grp_tail, 0, ps);
                                     else
                                         mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps);
-                                    mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps);
+                                    mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps, P.Hscale);   // P3a.1
                                     const int b = (int) (g2 & 1);
                                     if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
                                     mmq::Product dn;
@@ -3691,6 +3703,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.n = ngx; dn.xq = P.Hq_g; dn.bounds = rel;
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
                                     dn.ld_dst = N;
+                                    dn.y_scale = mmq::fp4_activations(mmq_dt) ? P.Hscale : nullptr;   // P3a.1
                                     P.run_ctx->run(dn, ps);
                                     if (f.tail_off)   // P3a: s_down on the FP32 rows, as scale_down_rows documents
                                         mmq::scale_down_rows(P.Dm_b[b], N, rel, ngx, P.grp_tail, nr, ps);
@@ -3732,7 +3745,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     std::memcpy(P.host_bounds, P.bounds_host.data(), P.bounds_host.size() * 4);
                                     copy_i32(P.bounds, P.host_bounds, (int64_t) P.bounds_host.size(), ps);
                                 }
-                                mmq::quantize(P.mixed, P.src, P.Xq, mmq_gt, N, N, rows_peer, ps);
+                                mmq::quantize(P.mixed, P.src, P.Xq, mmq_gt, N, N, rows_peer, ps, P.Xscale);   // P3a.1
                                 pe.mark(kPeMoeGemm, ps);
                                 const auto& f = lay.fmt[(size_t) l];
                                 for (size_t j = 0; j < n; ++j) {
@@ -3758,18 +3771,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                     gu.n = ngx; gu.xq = P.Xq; gu.bounds = P.bounds + j0; gu.ids = P.ident;
                                     gu.total_rows = rows_peer; gu.max_rows = maxr; gu.dst = P.GU; gu.ld_dst = 1280;
+                                    gu.y_scale = mmq::fp4_activations(mmq_gt) ? P.Xscale : nullptr;   // P3a.1
                                     P.run_ctx->run(gu, ps);
                                     if (f.tail_off)   // P3a: gate/up scales read as swiglu reads the halves
                                         mmq::swiglu_scaled(P.GU + r0 * 1280, P.H + r0 * 640, nr, 640, P.bounds + j0,
                                                            ngx, P.grp_tail, r0, ps);
                                     else
                                         mmq::swiglu(P.GU + r0 * 1280, P.H + r0 * 640, nr, 640, !lay.native, ps);
-                                    mmq::quantize(P.H + r0 * 640, nullptr, P.Hq, mmq_dt, 640, 640, nr, ps);
+                                    mmq::quantize(P.H + r0 * 640, nullptr, P.Hq, mmq_dt, 640, 640, nr, ps, P.Hscale);   // P3a.1
                                     mmq::Product dn;
                                     dn.w = P.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                                     dn.n = ngx; dn.xq = P.Hq; dn.bounds = P.bounds + n + 1 + g2 * (MMQ_GROUP + 1);
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm + r0 * N;
                                     dn.ld_dst = N;
+                                    dn.y_scale = mmq::fp4_activations(mmq_dt) ? P.Hscale : nullptr;   // P3a.1
                                     P.run_ctx->run(dn, ps);
                                     if (f.tail_off)   // P3a: s_down on the FP32 rows before they go back
                                         mmq::scale_down_rows(P.Dm + r0 * N, N, dn.bounds, ngx, P.grp_tail, nr, ps);

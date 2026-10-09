@@ -41,7 +41,9 @@
   "data/draft_vocab_en.bin",
   "--kv-resident",
   "32768",
-  "--batch-mtp"
+  "--batch-mtp",
+  "--peer-prefill-rows",
+  "0"
  ],
  "sampling": {
   "temperature": 1.0,

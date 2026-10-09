@@ -27,7 +27,7 @@
   "--peer-devices",
   "1,2,3",
   "--peer-reserve-mib",
-  "256",
+  "768",
   "--max-context",
   "524288",
   "--kv",
@@ -46,7 +46,9 @@
   "yarn",
   "--rope-scale",
   "2.0",
-  "--vision"
+  "--vision",
+  "--peer-prefill-rows",
+  "0"
  ],
  "sampling": {
   "temperature": 1.0,

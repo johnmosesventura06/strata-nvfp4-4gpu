@@ -46,7 +46,9 @@
   "yarn",
   "--rope-scale",
   "2.0",
-  "--vision"
+  "--vision",
+  "--peer-prefill-rows",
+  "0"
  ],
  "sampling": {
   "temperature": 1.0,
