@@ -80,7 +80,16 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   P3a's share first.
 - P4 CLOSED as native: their server.py has the config "sampling" block with the
   same merge semantics (request wins). Just use it (configs/nvfp4-256k.json).
-- Family = orca-nvfp4 (Reddit post's model + our uncensored lane lineage);
-  huihui-nvfp4 is a 1-flag swap but costs a second 129 GB — owner's at gate.
+- 10-09 19:26: download complete 128.8/128.8 GB verified, 0 failures (~31 min @ ~65 MB/s).
+  Watcher pgrep -f self-match trap fired (watcher matched its own cmdline) - killed by PID.
+- 10-09 19:41: BOOT READY 35 s on :8190. Witnesses: peer GPU 1/2/3 5687 experts 14.64 GiB
+  each = 18,690/24,576 (76%) VRAM-resident + primary 1,629; PEER_HOT 0.45 moved 3915;
+  arena 63.28 GiB @4.17 GiB/s buffered; draft head 58,963 tok 152.9 MiB; 606 MiB free CUDA0.
+- 10-09 19:51-19:54 FIRST BENCH (engine-measured): sustained 2400-tok decode 86.3 t/s
+  (accept 1066/1443=73.9%); 16K cold pp 1999.8 t/s; NEEDLE @252,914 tok PASS exact
+  (cold pp 1945.7, decode-at-depth 89.4, accept 73.7%); determinism 3/3 distinct
+  (sampling live); short-turn 96.9-103.7; expert cache hit 85.6->93.0% across runs.
+  vs GGUF ladder (94-99/2159/2420): decode -8..-12%, pp -7..-17% — honest NVFP4 band,
+  quality is the point; agentic feel-test = owner gate.
 - 128.8 GB table verified from setup.py NVFP4_REPOS (pinned revs + SHAs);
   dl_nvfp4.py imports the same table. Download starts on ready-to-run only.
