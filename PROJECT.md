@@ -94,6 +94,17 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   strata wins solo, loses aggregate). Config of record = nvfp4-np4-262k.json (batch-mtp kept).
 - np1 config stands as nvfp4-256k.json (86.3 sustained / 18,690 experts resident).
 
+## 10-09 22:25: rebased onto 0.1.41-nvfp4.3 (8d2ef15); old-fork PR audit
+- eddoursul custom tip UNCHANGED (3a199441) — the "improvements" there are open PRs only.
+  Audited vs this tree: #6 SMT pool workers ALREADY HERE (session.cpp core reservation);
+  #7 QUIT stdin ALREADY HERE; #11 deterministic adapt = STRATA_ADAPT_WAIT here; #5 file-tier
+  N/A (full-RAM mode); #2 GGUF-tier lockup N/A (P1 design + evict-sync); #8 easy via
+  draft_vocab.py --add; #9 image-prompt-cache = future optimization; #10 GGUF-math knob.
+- .3 content: huihui-nvfp4 WITHDRAWN upstream ("loops in long thinking"), orca-nvfp4 now
+  the default family — we were already on orca (external validation of the quant-loop story).
+  Engine delta .2->.3 is Windows-only (pagefile counting). Rebase clean, rebuilt 19/19;
+  live lane keeps the .2 binary (identical Linux behavior); next boot picks .3.
+
 ## State log
 - 10-09 18:0x: probe flat 0% util while generating = cloud-served, safe. Ejected
   uncensored container (cards 16 MiB, RAM 117 GiB avail). Mirrored tree, fetched
