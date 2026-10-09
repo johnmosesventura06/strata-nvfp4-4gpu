@@ -1,6 +1,8 @@
 {
   "exe": "build/strata",
   "cwd": "/home/ai-host/strata-nvfp4/strata",
+  "log": "/home/ai-host/strata-nvfp4/strata/nvfp4-engine.log",
+  "model_name": "strata-nvfp4",
   "args": [
     "--pack", "../models/orca-nvfp4/pack",
     "--native", "../models/orca-nvfp4/orca-nvfp4-dense.gguf",
@@ -27,6 +29,9 @@
     "repetition_penalty": 1.0
   },
   "tokenizer": "../models/orca-nvfp4/pack/tokenizer",
+  "env": {
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID"
+  },
   "host": "127.0.0.1",
   "port": 8190
 }
