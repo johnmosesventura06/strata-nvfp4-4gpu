@@ -124,6 +124,33 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   Off by default; np1 only for now (batch still refuses session files, engine + server).
 - Rollback of the whole arm: RESTORE.sh bank + git tags; durable-KV lift = 1 commit, re-adding the refusal is trivial.
 
+## NVMe durability tier for the conversation cache — DESIGN (owner ask 10-10 04:19; GO pending)
+
+Golden-lane parity spec: ~100 GB on NVMe, oldest evicted, a session still inside it restores
+immediately after a restart instead of recomputing.
+
+Everything needed already exists in the engine; this wires three existing primitives together:
+1. PARKED conversations are SavedConversation images (conversation_cache.hpp entries_; park site
+   generate.cpp ~7415-7547 ends in conversations.put(image, held)).
+2. The STRSESS v1 file format already serializes exactly that image with model+config fingerprint
+   and hash checks: session_file_write(path, image, identity, ...) / session_file_read(path,
+   identity, image, ...) (conversation_file.cpp:1168/1241). No new format - stale-engine files are
+   refused by the fingerprints, same rules as disk sessions.
+3. The mount path (conversations.best -> unpark) is prefix-LCP already.
+
+New flag: --conversation-cache-dir DIR (+ --conversation-cache-disk-mib CAP, default 102400).
+- On park success: async writer thread also writes DIR/<sha>.bin (key = hash of the conversation's
+  token ids + fingerprint), then prunes DIR to CAP by mtime (oldest first) = the golden-lane LRU.
+- At boot: scan DIR newest-first, session_file_read each (fingerprint refuses foreign/stale), fill
+  the RAM cache within budget/slots; the REST stay on disk.
+- On mount miss in RAM but hit on disk (key = prompt prefix hash): read + unpark = restore, not
+  re-prefill. np2-safe: all file I/O happens between requests on the park path - no control-line
+  interleaving, which is why this dodges the SAVE/RESTORE --batch refusal entirely.
+Cost: ~300-500 lines in generate.cpp + dir helpers; reuses all serialization/security. 1-2 days
+with the battery (park->restart->mount->correct-answer, corruption refuse, LRU prune, np2 interleave).
+Rollback point for the current verified state: tag golden-20261010-parking @ 8ab5b4b +
+ai-host ~/strata-nvfp4/rollback-golden-20261010/RESTORE.sh (binary md5 6f5699966b484ff4fc0ae7419890d596).
+
 ## State log
 - 10-09 18:0x: probe flat 0% util while generating = cloud-served, safe. Ejected
   uncensored container (cards 16 MiB, RAM 117 GiB avail). Mirrored tree, fetched
