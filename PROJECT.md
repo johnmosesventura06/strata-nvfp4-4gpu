@@ -105,6 +105,20 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   Engine delta .2->.3 is Windows-only (pagefile counting). Rebase clean, rebuilt 19/19;
   live lane keeps the .2 binary (identical Linux behavior); next boot picks .3.
 
+## Durable KV (session files) — WORKING with tiers, 10-10 01:15
+- Native feature (docs/DETAILS.md "Session files"): --slot-save-path DIR + POST /slots/0?action=save|restore.
+  File = live state + deepest checkpoint + every QSA layer K/V + draft K/V; bound to model+config fingerprints;
+  ~1.2 GB per 63K tokens; survives restarts of the same engine version + config.
+- Our lift: engine refused session files with --peer-device (one-line conservatism at the SAVE/RESTORE handler;
+  snapshot/restore code has ZERO peer coupling, restore settles tiers via apply_pending = our P1 loop). Removed,
+  rebuilt, PROVEN end-to-end on the np1+3-tier dkv lane: save 21,300 tok 409 ms -> engine restart -> restore
+  265 ms -> continuation reads 21,253 reused + 55 (435 ms vs 9,696 cold = 22x), marker recalled correctly.
+- Config: configs/nvfp4-256k-dkv.json (np1, tiers, slot_save_path "sessions"). P3b share stays OFF (rows 0).
+- STILL REFUSED: --batch (engine + server; control-line interleave with admission). For np2 durability: gate
+  save/restore on engine-idle (server side) + lift 9393. Workflow question for owner: auto-save per turn
+  (golden-lane journal style) vs client-driven /slots calls; filename scheme = conversation identity.
+- Rollback of the whole arm: RESTORE.sh bank + git tags; durable-KV lift = 1 commit, re-adding the refusal is trivial.
+
 ## State log
 - 10-09 18:0x: probe flat 0% util while generating = cloud-served, safe. Ejected
   uncensored container (cards 16 MiB, RAM 117 GiB avail). Mirrored tree, fetched

@@ -9389,7 +9389,9 @@ int main(int argc, char** argv) {
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
-                if (!o.peer_devices.empty()) { refuse("session files do not support --peer-device"); continue; }
+                // (durability arm): the --peer-device refusal lifted for the tier array - a session file holds
+                // conversation state (K/V, checkpoints, draft K/V) and the tiers hold only the expert cache,
+                // which the restore's apply_pending already settles for every tier. Verified on 4x5060 Ti.
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
