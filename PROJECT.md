@@ -67,3 +67,20 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
 - 10-09 18:0x: probe flat 0% util while generating = cloud-served, safe. Ejected
   uncensored container (cards 16 MiB, RAM 117 GiB avail). Mirrored tree, fetched
   pin, configured clean, baseline build launched. set_peer decline site located.
+- 10-09 18:2x: P1 N-peer SHIPPED (e5ba3a8): --peer-devices list, PeerExperts[3],
+  ExpertDispatch.peers/n_peers/peer_of, per-peer kind arrays, disjoint open +
+  merged-table adapt. Built clean, parse-tested (cap + list).
+- 10-09 18:3x: P2 CLOSED as no-port: both heads VRAM-resident here (dhead_,
+  output.weight); our head-split recouped a streaming cost this design doesn't
+  pay. Equivalents: --mtp-q4 head, --native-head-gguf (arms, not ports).
+- 10-09 18:4x: P3a SHIPPED (b109018): peer prompt path accepts NVFP4 packs —
+  gather tails beside group slots, swiglu_scaled + scale_down_rows on both peer
+  loops, primary fills row_sd=1 over the peer's Dm region. Built clean.
+  P3b (multi-peer prefill) deferred: PeerPrefill is single-instance; measure
+  P3a's share first.
+- P4 CLOSED as native: their server.py has the config "sampling" block with the
+  same merge semantics (request wins). Just use it (configs/nvfp4-256k.json).
+- Family = orca-nvfp4 (Reddit post's model + our uncensored lane lineage);
+  huihui-nvfp4 is a 1-flag swap but costs a second 129 GB — owner's at gate.
+- 128.8 GB table verified from setup.py NVFP4_REPOS (pinned revs + SHAs);
+  dl_nvfp4.py imports the same table. Download starts on ready-to-run only.
