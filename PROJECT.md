@@ -114,9 +114,14 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   rebuilt, PROVEN end-to-end on the np1+3-tier dkv lane: save 21,300 tok 409 ms -> engine restart -> restore
   265 ms -> continuation reads 21,253 reused + 55 (435 ms vs 9,696 cold = 22x), marker recalled correctly.
 - Config: configs/nvfp4-256k-dkv.json (np1, tiers, slot_save_path "sessions"). P3b share stays OFF (rows 0).
-- STILL REFUSED: --batch (engine + server; control-line interleave with admission). For np2 durability: gate
-  save/restore on engine-idle (server side) + lift 9393. Workflow question for owner: auto-save per turn
-  (golden-lane journal style) vs client-driven /slots calls; filename scheme = conversation identity.
+- session_auto SHIPPED (owner: "pattern it how golden lane durable cache works"): server config key
+  "session_auto": true (or {"name","settle_s"}), needs slot_save_path. Idle thread journals the slot
+  (settle 2 s after the last turn, FIFO held, engine idle; also before every unload; never a state the
+  NaN guard flagged untrusted); EVERY fresh engine start takes the journal back before serving
+  (ensure_loaded tail + main's eager start, once per engine pid; refused/stale fingerprint -> start cold).
+  PROVEN end-to-end: restart -> "session auto-restored 21285 tokens (0.2 s)" -> continuation reuses
+  21,250/21,290 in 297 ms (vs 9.7 s cold), code word recalled, zero client changes.
+  Off by default; np1 only for now (batch still refuses session files, engine + server).
 - Rollback of the whole arm: RESTORE.sh bank + git tags; durable-KV lift = 1 commit, re-adding the refusal is trivial.
 
 ## State log

@@ -52,5 +52,6 @@
  },
  "host": "100.71.205.101",
  "port": 8190,
- "slot_save_path": "sessions"
+ "slot_save_path": "sessions",
+ "session_auto": true
 }

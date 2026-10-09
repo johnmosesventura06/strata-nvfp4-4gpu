@@ -2609,6 +2609,12 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        # session_auto (the config, opt-in): journal the slot to disk when the engine goes idle between requests,
+        # and take the conversation back when a fresh engine starts - the golden-lane journal pattern on top of
+        # the session files. {"name": "auto.bin", "settle_s": 2.0} or true for the defaults. Off when absent.
+        self.session_auto = None
+        self.last_save_at = 0.0
+        self._restored_pid = None                     # session_auto: the journal is taken back once per engine process
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -2851,6 +2857,7 @@ class Service:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
                 print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+        self._auto_restore()   # session_auto: a freshly started engine takes back the journaled conversation
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
@@ -2935,6 +2942,8 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            if not self.restart_pending:   # session_auto: journal while the engine can still answer (a state
+                self._auto_save("before unload")   # flagged untrusted by the NaN guard is never journaled)
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
@@ -2956,6 +2965,86 @@ class Service:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    # ---- session_auto: the golden-lane journal pattern on the session files. The conversation the slot holds is
+    # written to <slot_save_path>/<name> whenever the engine sits idle past settle_s (and before an unload), and a
+    # freshly started engine takes it back before its first request. The engine's own fingerprints (model + config)
+    # invalidate a stale journal: a changed model or tier/context/quantization setting simply starts cold.
+
+    def _auto_save(self, reason: str) -> bool:
+        """Journal the slot between requests; the caller holds the FIFO and the engine is idle. Best effort: a
+        refused or failed save is one log line and serving goes on (the last good journal stays on disk)."""
+        if not self.session_auto or not self.slot_save_path or getattr(self.engine, "batch", 0):
+            return False
+        if not self.engine.alive():
+            return False
+        path = os.path.join(self.slot_save_path, self.session_auto["name"])
+        t0 = time.time()
+        try:
+            r = self.engine.session_file("save", path)
+            self.last_save_at = time.time()
+            print(f"[strata] session auto-saved {r.get('tokens', '?')} tokens, "
+                  f"{(r.get('bytes') or 0) / 1e9:.2f} GB -> {self.session_auto['name']} "
+                  f"({time.time() - t0:.1f} s, {reason})", flush=True)
+            return True
+        except (SessionRefused, EngineDied, EngineStuck, ValueError) as e:
+            print(f"[strata] session auto-save skipped ({e}; {reason})", flush=True)
+            return False
+
+    def _auto_restore(self):
+        """A fresh engine (load() took the slow path) takes back the journaled conversation before its first
+        request, while the FIFO is held. Refused (no file, stale fingerprint, engine out of step): start cold."""
+        if not self.session_auto or not self.slot_save_path or getattr(self.engine, "batch", 0):
+            return
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        if pid is None or self._restored_pid == pid:
+            return                                   # no process to attribute, or this one already took a journal
+        self._restored_pid = pid
+        path = os.path.join(self.slot_save_path, self.session_auto["name"])
+        if not os.path.exists(path):
+            return                                   # first start ever: nothing to take back yet
+        t0 = time.time()
+        try:
+            r = self.engine.session_file("restore", path)
+            self.last_save_at = time.time()   # the engine now holds exactly what the journal holds
+            print(f"[strata] session auto-restored {r.get('tokens', '?')} tokens from "
+                  f"{self.session_auto['name']} ({time.time() - t0:.1f} s)", flush=True)
+        except (SessionRefused, EngineDied, EngineStuck, ValueError) as e:
+            print(f"[strata] session auto-restore refused ({e}); starting cold", flush=True)
+
+    def start_session_auto(self):
+        if not self.session_auto or not self.slot_save_path:
+            return
+        if getattr(self.engine, "batch", 0):
+            print('[strata] session_auto is off with "parallel" (the engine refuses session files between '
+                  'the batch slots\' control lines); run one slot for the journal', flush=True)
+            self.session_auto = None
+            return
+        settle = float(self.session_auto.get("settle_s", 2.0))
+        print(f"[strata] session_auto: the conversation journals to {self.session_auto['name']} "
+              f"after {settle:.0f} s idle", flush=True)
+
+        def loop():
+            while True:
+                time.sleep(1.0)
+                try:
+                    last = self.last_request_at or 0.0
+                    if last <= self.last_save_at or time.time() - last < settle:
+                        continue
+                    with self.status_lock:
+                        if self.status.get("busy") or self.status.get("queued"):
+                            continue
+                    if not self.engine.alive():
+                        continue
+                    with self.fifo:   # a request may have started while we waited for the lock: re-check inside
+                        last = self.last_request_at or 0.0
+                        with self.status_lock:
+                            busy = self.status.get("busy") or self.status.get("queued")
+                        if last > self.last_save_at and not busy:
+                            self._auto_save("idle")
+                except EngineStuck as e:
+                    print(f"[strata] session auto-save: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -5836,6 +5925,16 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    sa = cfg.get("session_auto")   # journal the slot on idle, take it back on a fresh start (the golden-lane pattern)
+    if sa:
+        if not svc.slot_save_path:
+            raise SystemExit('[strata] config "session_auto" needs "slot_save_path" (the journal folder)')
+        sa = {"name": "auto.bin", "settle_s": 2.0, **(sa if isinstance(sa, dict) else {})}
+        why = slot_filename_problem(sa["name"])
+        if why:
+            raise SystemExit(f'[strata] config "session_auto" name {sa["name"]!r} {why}')
+        svc.session_auto = sa
+        svc._auto_restore()   # an engine main started never runs through ensure_loaded: take the journal back now
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -5888,6 +5987,7 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_session_auto()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
