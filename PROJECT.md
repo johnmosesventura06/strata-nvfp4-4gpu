@@ -63,6 +63,21 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   (NOT removed; docker start = instant rollback; reboot returns golden). Golden
   lane untouched throughout.
 
+## np4 (batch slots) — RESOLVED 10-09 21:30
+- Native: "parallel": N in config = engine --batch N. At 262K each slot carves 3.65 GiB VRAM
+  (per-slot KV pool, NOT shared) -> only 3.42 GiB free, batch died at 1 slot.
+- FIX = --kv-resident 32768 (KV streaming: 32K cells/layer in VRAM, whole K/V in 3.09 GiB
+  pinned RAM/slot): slot session 0.95 GiB, 4 slots fit (3.79 GiB, expert cache pays it;
+  primary cache 1629->266 slots, tiers absorb: 3x5726).
+- Also needed: --mtp-q4 head + --mtp-draft-vocab data/draft_vocab_en.bin — the BF16
+  58,963-token head (153 MiB) died vs 147 MiB free; --mtp-q4 converts AFTER the bf16 alloc
+  (upstream ordering trap), so the en subset (105 MiB) had to fit first, then q4 -> 55.7 MiB/step.
+- Measured (wall, 4x1200 tok): np4 plain 103.1 agg / 25.8 per-stream; np4+--batch-mtp
+  110.0 agg / 27.5-28.8 per-stream (+7%); SOLO on the batched lane 105.3 t/s = no regression.
+  Owner verdict: per-stream tax at 4 lanes = rig limit (vLLM np4 145-161 agg / 35-49 stream;
+  strata wins solo, loses aggregate). Config of record = nvfp4-np4-262k.json (batch-mtp kept).
+- np1 config stands as nvfp4-256k.json (86.3 sustained / 18,690 experts resident).
+
 ## State log
 - 10-09 18:0x: probe flat 0% util while generating = cloud-served, safe. Ejected
   uncensored container (cards 16 MiB, RAM 117 GiB avail). Mirrored tree, fetched
