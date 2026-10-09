@@ -84,8 +84,7 @@ def main() -> int:
             continue
         try:
             hf_hub_download(repo_id=repo, filename=path, revision=rev,
-                            local_dir=str(OUT / a.family), token=token,
-                            expected_checksums=None)   # hub-side check is optional; we verify below
+                            local_dir=str(OUT / a.family), token=token)   # we verify SHA-256 ourselves below
         except Exception as e:  # noqa: BLE001
             print(f"{time.strftime('%F %T')} FAIL     {path}: {e}", flush=True)
             failures += 1
