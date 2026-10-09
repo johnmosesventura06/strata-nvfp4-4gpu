@@ -688,6 +688,8 @@ struct PeerPrefill {
     void *Xq = nullptr, *Hq = nullptr;
     int32_t *src = nullptr, *bounds = nullptr, *ident = nullptr;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
+    bool nvfp4 = false;                   // P3a: the pack's experts carry a 16-byte FP32 tail {s_gate, s_up, s_down, 0}
+    float* grp_tail = nullptr;            // P3a: the group's tails, MMQ_GROUP x 4 floats on this card
     std::unique_ptr<mmq::Context> ctx;
     mmq::Context* run_ctx = nullptr;      // the context its products run in: ctx, or a layer split helper stage's
     // Without P2P (a layer split's helper) the activations and the result rows go through MAPPED pinned host buffers: the device that needs them reads them with a copy kernel.  A copy-engine
@@ -1671,12 +1673,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     const bool host_route_ok = [] { const char* v = std::getenv("STRATA_PF_PEER_HOST"); return v == nullptr || std::atoi(v) != 0; }();
     if (!peer->p2p() && !host_route_ok) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
-    {   // NVFP4: the peer's MMQ products have no per-expert scales (grp_tail, row_sd); its decode rows do
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        for (const auto& f : lay.fmt)
-            if (lay.native && f.tail_off) { err = "prefill peer: not for NVFP4 experts yet"; return false; }
-    }
+    // P3a (was: "the peer's MMQ products have no per-expert scales, so it declines NVFP4 packs"): the peer now
+    // gathers each expert's 16-byte tail {s_gate, s_up, s_down, 0} beside its group slot and applies the gate/up
+    // scales in swiglu_scaled and s_down in scale_down_rows - the primary's own expressions - so its rows leave
+    // the card already scaled.  Decided per layer (f.tail_off), as the primary does: a native pack without tails
+    // (Q2_0) and the requant pack's Q8_0-down layers keep the plain path.
+    const bool nvfp4_pack = strata::kernels::cpu::expert_layout().native;
     auto pp = std::make_unique<PeerPrefill>();
+    pp->nvfp4 = nvfp4_pack;
     pp->peer = peer;
     pp->p2p = peer->p2p();
     pp->T_max = m.T_max;
@@ -1715,6 +1719,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         return p;
     };
     pp->mixed = (float*) take((size_t) m.T_max * N * 4);
+    if (ok && pp->nvfp4) pp->grp_tail = (float*) take((size_t) MMQ_GROUP * 4 * sizeof(float));   // P3a
     {
         const char* v = std::getenv("STRATA_PF_PEER_COMPACT");
         pp->compact = (v == nullptr || std::atoi(v) != 0) || !pp->p2p;   // the layer-sized path copies over P2P only
@@ -3566,7 +3571,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         const size_t q = j - j0;
                                         if (lay.native)
                                             mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
-                                                               P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
+                                                               P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps,
+                                                               f.tail_off ? bd + f.tail_off : nullptr,
+                                                               f.tail_off ? P.grp_tail + q * 4 : nullptr);
                                         else
                                             mmq::gather_strata_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
                                         if (psl >= 0) {   // the slot is free once gathered
@@ -3586,7 +3593,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
                                     gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = 1280;
                                     P.run_ctx->run(gu, ps);
-                                    mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps);
+                                    if (f.tail_off)   // P3a: gate/up scales read as swiglu reads the halves
+                                        mmq::swiglu_scaled(P.GU_g, P.H_g, nr, 640, rel, ngx, P.grp_tail, 0, ps);
+                                    else
+                                        mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps);
                                     mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps);
                                     const int b = (int) (g2 & 1);
                                     if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
@@ -3596,6 +3606,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
                                     dn.ld_dst = N;
                                     P.run_ctx->run(dn, ps);
+                                    if (f.tail_off)   // P3a: s_down on the FP32 rows, as scale_down_rows documents
+                                        mmq::scale_down_rows(P.Dm_b[b], N, rel, ngx, P.grp_tail, nr, ps);
                                     if (P.sums && P.gather) {   // into the per-token sums, one launch for the group
                                         const int32_t* a = P.adds + P.adds_at[g2];
                                         const int64_t nt = P.ntok[g2];
@@ -3643,7 +3655,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const size_t q = j % MMQ_GROUP;
                                     if (lay.native)
                                         mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
-                                                           P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
+                                                           P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps,
+                                                           f.tail_off ? bd + f.tail_off : nullptr,
+                                                           f.tail_off ? P.grp_tail + q * 4 : nullptr);
                                     else
                                         mmq::gather_strata_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
                                     if (q + 1 < MMQ_GROUP && j + 1 < n) continue;
@@ -3659,7 +3673,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.n = ngx; gu.xq = P.Xq; gu.bounds = P.bounds + j0; gu.ids = P.ident;
                                     gu.total_rows = rows_peer; gu.max_rows = maxr; gu.dst = P.GU; gu.ld_dst = 1280;
                                     P.run_ctx->run(gu, ps);
-                                    mmq::swiglu(P.GU + r0 * 1280, P.H + r0 * 640, nr, 640, !lay.native, ps);
+                                    if (f.tail_off)   // P3a: gate/up scales read as swiglu reads the halves
+                                        mmq::swiglu_scaled(P.GU + r0 * 1280, P.H + r0 * 640, nr, 640, P.bounds + j0,
+                                                           ngx, P.grp_tail, r0, ps);
+                                    else
+                                        mmq::swiglu(P.GU + r0 * 1280, P.H + r0 * 640, nr, 640, !lay.native, ps);
                                     mmq::quantize(P.H + r0 * 640, nullptr, P.Hq, mmq_dt, 640, 640, nr, ps);
                                     mmq::Product dn;
                                     dn.w = P.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
@@ -3667,6 +3685,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm + r0 * N;
                                     dn.ld_dst = N;
                                     P.run_ctx->run(dn, ps);
+                                    if (f.tail_off)   // P3a: s_down on the FP32 rows before they go back
+                                        mmq::scale_down_rows(P.Dm + r0 * N, N, dn.bounds, ngx, P.grp_tail, nr, ps);
                                     if (P.out_pipe && nr > 0) {   // this group's rows go back while the next group computes
                                         cudaEventRecord(P.ev_grp[g2], ps);
                                         cudaStreamWaitEvent(P.s_out, P.ev_grp[g2], 0);
@@ -4025,6 +4045,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
                         if (!m.pp->p2p && !m.pp->sums)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
+                        if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off &&
+                            !m.pp->sums && m.pp->back_rows > 0)
+                            // P3a: the peer applied s_down to its rows itself (scale_down_rows); the combine must
+                            // read 1 there - this region's value is whatever the last layer that reached it wrote.
+                            cudaMemcpyAsync(m.row_sd + (size_t) m.pp->back_at, m.cpu_ones,
+                                            (size_t) m.pp->back_rows * sizeof(float), cudaMemcpyHostToDevice, m.cs);
                     }
                     const float* row_sd_l = use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr;
                     // The combine and the write below in one kernel where that write is gr_write_norm_rs (the same

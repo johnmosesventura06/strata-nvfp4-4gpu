@@ -24,7 +24,7 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
 | # | feature | our ref | surface here | status |
 |---|---|---|---|---|
 | P1 | N-peer adaptive tiers (--peer-devices 1,2,3) | tier-gpus commits on custom-4gpu | PeerExperts array + ExpertDispatch.peers/n_peers + peer_of(); per-peer kind arrays in the pool; disjoint by filtered open + merged-table adapt; prompt share stays single-tier | **built, parse-tested** |
-| P2 | N-way head-split | 122583e (SplitHead ranges) | their draft head = --mtp-draft-vocab/--mtp-q4 head mechanism; find where head rows live (VRAM vs streamed) before porting ranges | pending |
+| P2 | N-way head-split | 122583e (SplitHead ranges) | **NOT APPLICABLE — superseded by their design.** Both heads are VRAM-resident on CUDA0 here (draft head = mtp.cpp dhead_ device buffer, main head = output.weight in the dense table); our +6-8% recouped host-STREAMING cost that only the eddoursul design pays. Splitting resident rows onto peers would ADD PCIe reads. Their CUDA0-freeing equivalents: --mtp-q4 head (Q4_0 draft head, ~250 MiB back) and --native-head-gguf (Q5_K main head) — optional arms, not ports | **closed: no port** |
 | P3 | peer prompt path for NVFP4 + N-way offload | 4878ee5 (runner vector) | EXACT decline site found: prefill.cpp Prefill::set_peer refuses packs with f.tail_off (per-expert scales) because the peer's MMQ products lack scale application; decode grouped kernel already applies them. Port = apply scales in peer prefill MMQ, then multi-peer | pending |
 | P4 | sampling config block | nw-samp.json pattern | their server.py forwards per-request sampling; add config-level "sampling" defaults merge (defaults = Qwen stock temp 1.0/top_p 0.95/top_k 20/min_p 0) | pending |
 
