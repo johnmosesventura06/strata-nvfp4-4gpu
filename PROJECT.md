@@ -63,6 +63,22 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   (NOT removed; docker start = instant rollback; reboot returns golden). Golden
   lane untouched throughout.
 
+## 512K + vision + the shared-pool verdict — 10-09 22:15
+- 512K YaRN (factor 2.0) + vision: LIVE as configs/nvfp4-512k-np2-vision.json (:8190).
+  np4 @512K does NOT fit CUDA0: per-slot session grows 0.95->1.39 GiB at 512K (RoPE table +
+  indexer scale with context), 4x1.39 + prompt staging > 3.48 GiB free -> engine died at
+  prefill-buffer alloc. np2 @512K boots healthy: 2.78 GiB slots, primary cache back to
+  1,520 slots, 18,650/24,576 (76%) resident.
+- Vision: tools/vision builds CPU-only on Linux (cmake -S tools/vision -B build-vision-cpu
+  -DLLAMA_DIR=~/strata-nvfp4/llama.cpp); encoder weights = shared ISTA mmproj-BF16.gguf
+  (907 MB, bin/dl_mmproj.py, same base model per setup.py #967); config "vision" block +
+  --vision. PROBE PASS: synthetic PNG described correctly in 2.0 s (bin/probe_vision.py).
+- SHARED KV POOL verdict (code-checked): NO per-slot context knob — every slot carves
+  session_bytes(g, o.max_context). True sharing = page tables through QSA select/gather/
+  attention/RoPE/checkpoint + graph invalidation on remap = redesign, weeks. What exists
+  today: per-slot PRIVATE pools (llama-style, owner-rejected for np4) OR smaller ctx with
+  more slots OR bigger ctx with fewer slots. The ladder: np4@262K / np2@512K / np1@512K+.
+
 ## np4 (batch slots) — RESOLVED 10-09 21:30
 - Native: "parallel": N in config = engine --batch N. At 262K each slot carves 3.65 GiB VRAM
   (per-slot KV pool, NOT shared) -> only 3.42 GiB free, batch died at 1 slot.
