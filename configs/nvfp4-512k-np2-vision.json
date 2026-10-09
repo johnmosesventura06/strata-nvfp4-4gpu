@@ -48,7 +48,9 @@
   "2.0",
   "--vision",
   "--peer-prefill-rows",
-  "0"
+  "0",
+  "--conversation-cache-mib",
+  "16384"
  ],
  "sampling": {
   "temperature": 1.0,
