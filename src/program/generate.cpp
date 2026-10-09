@@ -843,13 +843,14 @@ void usage() {
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
                   "  --peer-devices LIST  up to 3 tier GPUs, comma-separated (e.g. 1,2,3): the tiers are disjoint\n"
                   "                       (each holds what the primary and the earlier ones do not) and each adapts\n"
-                  "                       beside the others' holdings.  The prompt share applies to a single\n"
-                  "                       --peer-device only; the same refusals as --peer-device apply.\n"
+                  "                       beside the others' holdings.  Each also computes its held experts' prompt\n"
+                  "                       rows (--peer-prefill-rows, split across them); the streamed ring and the\n"
+                  "                       sums route stay with a single --peer-device.  The same refusals apply.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
-                 "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
-                 "                       0 = the prompt path stays on the primary)\n"
+                 "  --peer-prefill-rows N  prompt rows per layer the tiers compute (default half of chunk x top-k,\n"
+                 "                       split across them; 0 = the prompt path stays on the primary)\n"
                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
@@ -6950,9 +6951,11 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
-        if (n_peers == 1 && o.peer_prefill_rows != 0) {   // the prompt share stays single-tier (multi-peer is P3)
+        if (n_peers > 0 && o.peer_prefill_rows != 0) {   // P3b: every tier computes its held experts' prompt rows
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            if (!sp.set_peer(&peers[0], rows, err)) {
+            strata::core::PeerExperts* parr[3];
+            for (int p = 0; p < n_peers; ++p) parr[p] = &peers[p];
+            if (!sp.set_peers(parr, n_peers, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                 err.clear();
             }

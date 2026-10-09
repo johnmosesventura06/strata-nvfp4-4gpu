@@ -27,6 +27,8 @@ namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
 
+struct PeerPrefill;   // defined in prefill.cpp: one tier GPU's prompt share (P3b: an array of these)
+
 struct PrefillStats {
     int64_t tokens = 0;
     int64_t chunks = 0;
@@ -133,6 +135,12 @@ public:
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
 
+    /// P3b: the held experts of EVERY tier compute there during prefill - one PeerPrefill per tier, `cap_rows_total`
+    /// split evenly.  Tier 0 keeps the streamed ring and the sums route only when n == 1 (with more tiers the rows
+    /// return per tier as plain blocks and the primary's combine reads them all); a tier whose buffers do not fit
+    /// is dropped with a line, the rest still run.  Replaces any earlier set_peer/set_peers shares.
+    bool set_peers(core::PeerExperts** peers, int n, int64_t cap_rows_total, std::string& err);
+
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
@@ -193,6 +201,11 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    /// P3b: build one tier's prompt share (the former set_peer body).  `stream_ok` keeps the streamed ring and
+    /// `sums_ok` the sums route - both only for a single share; with several tiers each computes its held experts
+    /// and returns plain row blocks.  Null on refusal, `err` set.
+    std::unique_ptr<PeerPrefill> make_pp(core::PeerExperts* peer, int64_t cap_rows, bool stream_ok, bool sums_ok,
+                                         std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;

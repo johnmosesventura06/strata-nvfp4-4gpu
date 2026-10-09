@@ -886,7 +886,11 @@ struct Prefill::Impl {
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
-    std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
+    std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer); P3b: tier 0 of the array
+    std::vector<std::unique_ptr<PeerPrefill>> pps;   // P3b: tiers 1..k-1 (set_peers). Tier 0 keeps the streamed ring and
+                                             // every m.pp site; the held-expert loop runs over pp_at()/n_pp().
+    PeerPrefill* pp_at(int i) const { return i == 0 ? pp.get() : pps[(size_t) (i - 1)].get(); }
+    int n_pp() const { return (pp ? 1 : 0) + (int) pps.size(); }
     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
     std::unique_ptr<PeerPrefill> help_pp;
@@ -1665,14 +1669,14 @@ bool Prefill::bind_stage_helper(int64_t T) {
     return true;
 }
 
-bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
+std::unique_ptr<PeerPrefill> Prefill::make_pp(core::PeerExperts* peer, int64_t cap_rows, bool stream_ok,
+                                             bool sums_ok, std::string& err) {
     Impl& m = *impl_;
-    if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // Without P2P the activations and the result rows take the mapped host route of the layer split's helper
     // (STRATA_PF_PEER_HOST=0: refuse as before, the prompt path then stays on the primary)
     const bool host_route_ok = [] { const char* v = std::getenv("STRATA_PF_PEER_HOST"); return v == nullptr || std::atoi(v) != 0; }();
-    if (!peer->p2p() && !host_route_ok) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
-    if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
+    if (!peer->p2p() && !host_route_ok) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return nullptr; }
+    if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return nullptr; }
     // P3a (was: "the peer's MMQ products have no per-expert scales, so it declines NVFP4 packs"): the peer now
     // gathers each expert's 16-byte tail {s_gate, s_up, s_down, 0} beside its group slot and applies the gate/up
     // scales in swiglu_scaled and s_down in scale_down_rows - the primary's own expressions - so its rows leave
@@ -1687,14 +1691,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, m.T_max * K));
     const int64_t R = pp->cap_rows;
     const MmqPlan& mp = mmq_plan();
-    if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
+    if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return nullptr; }
     if (!pp->p2p) {   // the host route's copies on a stream of their own (STRATA_PF_PEER_XSTREAM=0: the compute stream)
         const char* xv = std::getenv("STRATA_PF_PEER_XSTREAM");
         if ((xv == nullptr || std::atoi(xv) != 0) &&
             (cudaStreamCreateWithFlags(&pp->x_stream, cudaStreamNonBlocking) != cudaSuccess ||
              cudaEventCreateWithFlags(&pp->ev_x, cudaEventDisableTiming) != cudaSuccess)) {
             err = "prefill peer: copy stream";
-            return false;
+            return nullptr;
         }
     }
     int prev = 0;
@@ -1737,6 +1741,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
         const char* fs = std::getenv("STRATA_PF_PEER_STREAM");
         pp->ps_frac = fs ? std::atof(fs) : 0.35;   // measured: 0.25-0.5 all ~1950-1970 at 32K, 0.35 best
+        if (!stream_ok) pp->ps_frac = 0.0;   // P3b: with several tiers the ring stays off (held experts only)
         if (pp->ps_frac > 0.0 && !mp.fallback && m.T_max >= stream_all_min()) {
             pp->RP = 48;
             if (const char* pr = std::getenv("STRATA_PF_PEER_RING"); pr != nullptr) pp->RP = std::atoi(pr);
@@ -1763,7 +1768,8 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     const int64_t Rt = pp->cap_rows;
     if (!pp->p2p && pp->compact) {
         const char* v = std::getenv("STRATA_PF_PEER_SUMS");
-        pp->sums = v == nullptr || std::atoi(v) != 0;
+        // P3b: the sums route and the streamed ring belong to a single share (set_peers gates them)
+        pp->sums = sums_ok && (v == nullptr || std::atoi(v) != 0);
     }
     if (pp->sums) {
         const char* v = std::getenv("STRATA_PF_PEER_F16");
@@ -1821,13 +1827,13 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
             cudaSetDevice(prev);
             err = "prefill peer: the host route's pinned buffers (" +
                   std::to_string(((size_t) pp->cap_rows * N * 4 + (size_t) m.T_max * N * 4) >> 20) + " MiB) do not fit in RAM";
-            return false;
+            return nullptr;
         }
     }
     size_t fb = 0, tb = 0;
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(prev);
-    if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
+    if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return nullptr; }
     std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
                          "layer%s%s); %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
                  pp->p2p ? "" : (pp->sums ? (pp->f16 ? ", no P2P: through mapped host memory in FP16, one weighted sum per token back"
@@ -1836,7 +1842,42 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
                                                     "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
                                                  : ", compact group buffers") : "", fb >> 20);
-    m.pp = std::move(pp);
+    return pp;
+}
+
+bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
+    Impl& m = *impl_;
+    if (peer == nullptr || !peer->valid()) { m.pp.reset(); m.pps.clear(); return true; }
+    auto p = make_pp(peer, cap_rows, true, true, err);
+    if (p == nullptr) return false;   // err set: the caller keeps the prompt path on the primary
+    m.pp = std::move(p);
+    m.pps.clear();
+    return true;
+}
+
+bool Prefill::set_peers(core::PeerExperts** peers, int n, int64_t cap_rows_total, std::string& err) {
+    Impl& m = *impl_;
+    m.pp.reset();
+    m.pps.clear();
+    if (peers == nullptr || n < 1) return true;
+    int live = 0;
+    for (int i = 0; i < n; ++i) if (peers[i] != nullptr && peers[i]->valid()) ++live;
+    if (live == 0) return true;
+    const int64_t cap_i = std::max<int64_t>(1, cap_rows_total / live);   // P3b: the row budget splits evenly
+    bool first = true;
+    for (int i = 0; i < n; ++i) {
+        if (peers[i] == nullptr || !peers[i]->valid()) continue;
+        std::string e;
+        auto p = make_pp(peers[i], cap_i, live == 1, live == 1, e);
+        if (p == nullptr) {
+            if (first) { err = e; return false; }   // tier 0 is the peer of old: its refusal is the refusal
+            std::fprintf(stderr, "strata prefill: tier GPU %d takes no prompt share (%s)\n",
+                         peers[i]->device(), e.c_str());
+            continue;   // a tier whose buffers do not fit simply decodes, as before P3b
+        }
+        if (first) { m.pp = std::move(p); first = false; }
+        else m.pps.push_back(std::move(p));
+    }
     return true;
 }
 
@@ -3029,6 +3070,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
+                    // P3b: the per-tier prompt blocks of this layer (filled by the classification below; the
+                    // return side waits on them and the combine reads their rows where they lie in Dm)
+                    struct PBlk { PeerPrefill* P; std::vector<int32_t> ord; int64_t at, rows; };
+                    std::vector<PBlk> blks;
                     // set_cpu_pool: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm), computed on a thread
                     // that reads on_cpu: declared first, so the future (which waits for the thread) goes first
                     std::vector<char> on_cpu;
@@ -3234,25 +3279,38 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ++n_cpu;
                             }
                         }
-                        // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
+                        // multi-GPU: the rows of the experts the tiers compute go last, as one block per tier
+                        // (P3b; with a single tier, one block [rows_local, T*K) holding the peer's, as before)
                         const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
-                        std::vector<char> on_peer;
+                        std::vector<char> on_peer;                     // 0 none, 1 held by its tier, 2 streamed (tier 0's ring)
+                        std::vector<int8_t> own_blk;                   // P3b: the tier holding an on_peer==1 expert
+                        const int npp = m.n_pp();
+                        std::array<int64_t, 4> rows_blk{};             // P3b: held rows per tier
+                        int64_t rows_str = 0;                          // ...and the streamed rows (tier 0, single tier only)
                         int64_t rows_local = T * K, rows_peer = 0;
-                        if (m.pp && pre_mmq) {
+                        if (npp > 0 && pre_mmq) {
                             on_peer.assign((size_t) m.g->n_expert, 0);
+                            own_blk.assign((size_t) m.g->n_expert, -1);
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
                                 if (c > 0 && !m.pp->ps_flag.empty() && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) {   // peer-streamed
                                     on_peer[(size_t) e] = 2;
+                                    rows_str += c;
                                     rows_peer += c;
                                     continue;
                                 }
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
-                                    !m.pp->peer || !m.pp->peer->has(l, e))
+                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
                                     continue;
-                                if (rows_peer + c > m.pp->cap_rows) { ++m.pp->over_cap; continue; }
-                                on_peer[(size_t) e] = 1;
-                                rows_peer += c;
+                                for (int o = 0; o < npp; ++o) {   // P3b: the tier that holds it computes it (the tiers are disjoint)
+                                    PeerPrefill* Q = m.pp_at(o);
+                                    if (!Q->peer || !Q->peer->has(l, e)) continue;
+                                    if (rows_blk[(size_t) o] + c > Q->cap_rows) { ++Q->over_cap; break; }
+                                    on_peer[(size_t) e] = 1;
+                                    own_blk[(size_t) e] = (int8_t) o;
+                                    rows_blk[(size_t) o] += c;
+                                    rows_peer += c;
+                                    break;
+                                }
                             }
                             rows_local = T * K - rows_peer;
                         }
@@ -3263,10 +3321,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.off[(size_t) e] = r;
                                     r += m.cnt[(size_t) e];
                                 }
-                            // the peer's rows in order_peer's order (peer-held, then peer-streamed): its groups need them contiguous
-                            for (int kind = 1; kind <= 2 && !on_peer.empty(); ++kind)
+                            // the tiers' rows in per-tier blocks (each one's groups need their rows contiguous):
+                            // tier 0's held, the other tiers' held, then the streamed ones last (their copies get the most time)
+                            for (int o = 0; o < npp && !on_peer.empty(); ++o)
                                 for (int32_t e = 0; e < m.g->n_expert; ++e)
-                                    if (on_peer[(size_t) e] == kind) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
+                                    if (on_peer[(size_t) e] == 1 && own_blk[(size_t) e] == o) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
+                            for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)
+                                if (on_peer[(size_t) e] == 2) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             m.off[(size_t) m.g->n_expert] = r;
@@ -3280,13 +3341,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             src_h[(size_t) p] = (int32_t) (i / K);
                         }
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
-                        std::vector<int32_t> order, order_peer;
+                        std::vector<int32_t> order;
+                        std::array<std::vector<int32_t>, 4> order_blk;   // P3b: each tier's held experts, in id order
+                        std::vector<int32_t> order_str;                  // ...and the streamed ones (tier 0's second block)
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
-                            if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] != 2) &&
+                            if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] == 0) &&
                                 (on_cpu.empty() || !on_cpu[(size_t) e]))
-                                (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
-                        for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
-                            if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
+                                order.push_back(e);
+                        for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e) {
+                            if (on_peer[(size_t) e] == 1) order_blk[(size_t) own_blk[(size_t) e]].push_back(e);
+                            else if (on_peer[(size_t) e] == 2) order_str.push_back(e);
+                        }
+                        // P3b: the blocks each share computes this layer.  One tier: held + streamed as ONE block,
+                        // exactly the pre-P3b order.  Several: one held block per tier (the ring is off, rows_str is 0).
+                        blks.clear();
+                        {
+                            int64_t acc = rows_local;
+                            if (npp == 1) {
+                                std::vector<int32_t> ord = order_blk[0];
+                                ord.insert(ord.end(), order_str.begin(), order_str.end());
+                                if (!ord.empty()) blks.push_back({m.pp.get(), std::move(ord), acc, rows_peer});
+                            } else {
+                                for (int o = 0; o < npp; ++o) {
+                                    if (order_blk[(size_t) o].empty()) continue;
+                                    blks.push_back({m.pp_at(o), std::move(order_blk[(size_t) o]), acc, rows_blk[(size_t) o]});
+                                    acc += rows_blk[(size_t) o];
+                                }
+                            }
+                        }
+                        // (the block loop below binds each block's own order_peer/rows_local/rows_peer)
                         // Aurora (STRATA_MMQ_RESIDENT_SORT_NE=1, opt-in): a layer whose experts are ALL resident and
                         // run through MMQ groups takes them in row-count order, so each 16-expert group's max_rows
                         // (its padded tile rows) is close to its experts' own; slot/src/off are rebuilt coherently
@@ -3435,10 +3518,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                         }
-                        // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
-                        peer_now = use_mmq && !order_peer.empty();
-                        if (peer_now) {
-                            PeerPrefill& P = *m.pp;
+                        // multi-GPU: each tier's block, enqueued before the primary's own experts so the cards work at once
+                        peer_now = use_mmq && !blks.empty();
+                        for (auto& B : blks) {   // P3b: one block per tier (single tier: one block, exactly as before)
+                            if (!peer_now) break;
+                            PeerPrefill& P = *B.P;
+                            const std::vector<int32_t>& order_peer = B.ord;
+                            const int64_t rows_local = B.at, rows_peer = B.rows;   // this block's row range in Dm
                             // the host route's copies beside the compute stream: the primary's own experts start at once
                             // (mixed_h and w are rewritten only after this layer's combine, which waits for the peer)
                             cudaStream_t xs = m.cs;
@@ -4041,16 +4127,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.pend_l = (int) l;
                         m.pend_wall_n = n_stream;
                     }
-                    if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
-                        cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
-                        if (!m.pp->p2p && !m.pp->sums)
-                            copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
-                        if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off &&
-                            !m.pp->sums && m.pp->back_rows > 0)
-                            // P3a: the peer applied s_down to its rows itself (scale_down_rows); the combine must
-                            // read 1 there - this region's value is whatever the last layer that reached it wrote.
-                            cudaMemcpyAsync(m.row_sd + (size_t) m.pp->back_at, m.cpu_ones,
-                                            (size_t) m.pp->back_rows * sizeof(float), cudaMemcpyHostToDevice, m.cs);
+                    if (peer_now) {   // multi-GPU: each tier's rows are in Dm (or, without P2P, in host memory)
+                        for (const auto& B : blks) {
+                            PeerPrefill& Q = *B.P;
+                            cudaStreamWaitEvent(m.cs, Q.ev_done, 0);
+                            if (!Q.p2p && !Q.sums)
+                                copy_f32_wide(m.Dm + (size_t) Q.back_at * N, Q.host_rows, Q.back_rows * N, m.cs);
+                            if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off &&
+                                !Q.sums && Q.back_rows > 0)
+                                // P3a: the tier applied s_down to its rows itself (scale_down_rows); the combine must
+                                // read 1 there - this region's value is whatever the last layer that reached it wrote.
+                                cudaMemcpyAsync(m.row_sd + (size_t) Q.back_at, m.cpu_ones,
+                                                (size_t) Q.back_rows * sizeof(float), cudaMemcpyHostToDevice, m.cs);
+                        }
                     }
                     const float* row_sd_l = use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr;
                     // The combine and the write below in one kernel where that write is gr_write_norm_rs (the same
