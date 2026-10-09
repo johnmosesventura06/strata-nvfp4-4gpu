@@ -50,7 +50,7 @@
   "--peer-prefill-rows",
   "0",
   "--conversation-cache-mib",
-  "16384"
+  "25600"
  ],
  "sampling": {
   "temperature": 1.0,
