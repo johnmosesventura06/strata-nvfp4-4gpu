@@ -33,10 +33,11 @@ echo "$MARK" > /tmp/nvfp4-boot-marker
 setsid nohup python3 serve/server.py --engine strata --config "configs/$CFG.json" \
   --port "$PORT" > "/tmp/$MARK.log" 2>&1 < /dev/null & disown
 
-# 4. readiness = health endpoint only
+# 4. readiness = health endpoint only (host comes from the config: tailnet-bound needs the tailnet IP)
+H=$(python3 -c "import json;print(json.load(open('configs/$CFG.json')).get('host','127.0.0.1'))")
 for i in $(seq 1 90); do
   sleep 5
-  if curl -s -m 3 "http://127.0.0.1:$PORT/health" | grep -q '"loaded": true'; then
+  if curl -s -m 3 "http://$H:$PORT/health" | grep -q '"loaded": true'; then
     echo "READY $MARK (port $PORT, $((i * 5)) s)"
     exit 0
   fi
