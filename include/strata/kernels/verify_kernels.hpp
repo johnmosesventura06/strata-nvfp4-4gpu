@@ -121,7 +121,14 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 /// their picks.  `scratch`: argmax_rows_scratch_bytes(n_rows), zero before the first launch (each launch leaves it
 /// so).  Graph-capturable.
 uint64_t argmax_rows_scratch_bytes(int n_rows);
-void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream);
+void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream,
+                 float* out_val = nullptr);
+/// *flag += 1 once the stream's earlier work is visible to the host (mapped memory).  Graph-capturable.
+/// (head-split: the window graph's handoff/done counters.)
+void mapped_bump(uint32_t* flag, void* stream);
+/// head-split: dst[t][lo..hi) = src[t][0..hi-lo) for `rows` rows - a part's logits into the full-vocab row, read
+/// through volatile (the source can be mapped host memory a peer GPU wrote).  Graph-capturable.
+void join_range(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc, int rows, void* stream);
 /// row_top_prob over 8 blocks a row, each computing 4 of its 32 warps' sums, the row's last block adding the 32 in
 /// order: bitwise row_top_prob.  `scratch`: row_top_prob_scratch_bytes(n_rows), zero before the first launch.
 uint64_t row_top_prob_scratch_bytes(int n_rows);
