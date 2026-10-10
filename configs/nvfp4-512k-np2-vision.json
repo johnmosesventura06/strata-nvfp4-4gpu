@@ -11,7 +11,7 @@
   "--native-dense-gguf",
   "../models/orca-nvfp4/orca-nvfp4-dense.gguf",
   "--ple-gguf",
-  "../models/orca-nvfp4/ple-fp8.gguf",
+  "../models/orca-nvfp4/ple-bf16.gguf",
   "--embd-gguf",
   "../models/orca-nvfp4/token-embd-bf16.gguf",
   "--mtp",
