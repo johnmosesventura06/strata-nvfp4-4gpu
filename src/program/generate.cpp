@@ -6587,7 +6587,12 @@ int main(int argc, char** argv) {
         strata::prefill::Prefill sp;
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
-        const bool share_pool = o.batch <= 0 && !o.no_pool;
+        // F10-share (the 4-GPU lane): an explicit STRATA_PREFILL_CPU_SHARE also wires the pool when the engine
+        // serves batch slots with no layer split.  The old ban assumed batch-slot decode busy-worked the pool; on
+        // this build the decode path never dispatches it (its only caller is the share itself), so the workers
+        // are idle during a prompt — same opt-in env, same measured auto-share, now usable with --batch > 0.
+        const bool explicit_share = std::getenv("STRATA_PREFILL_CPU_SHARE") != nullptr;
+        const bool share_pool = !o.no_pool && (o.batch <= 0 || (explicit_share && stages.empty() && !multi_gpu));
         strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
