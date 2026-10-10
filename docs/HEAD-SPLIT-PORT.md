@@ -117,6 +117,42 @@ graph-compatible, measured +3-5% there._
 
 ### LEFT (resume here)
 
+**UPDATE 10-11 04:35 — P3 DONE + audited; parity gate in flight (battery3).**
+
+- P3 wiring committed in 37d1324: --head-split FRAC (option/help/parse), SplitHead construction
+  after the native head loads (256-aligned tiling; main keeps whole weights, computes [0,split0)
+  via native_mmvq n_out — NO truncation so the draft head and all consumers keep the full table),
+  set_split_heads on the serve verifier (~7242) and the one-shot generate verifier (~12387), both
+  before init. Layer-split/pipeline verifiers unsplit by design (v1). Build clean on ai-host.
+- OWNER-REQUESTED AUDIT (hunk-by-hunk vs bde25db) found TWO silent defects, both fixed in 37d1324:
+  1. verify.cpp init: tiling validation + head_rows_ assignment were anchored after `head_ = head;`
+     but BEFORE `n_vocab_ = wo->ne1;` → validated against 0. Symptoms: split-off boot 400'd every
+     request ("native MMVQ requires n_out > 0" — head_rows_ was 0 on the native-head path too!),
+     split-on refused at init ("tile [61952, 0)"). Moved after the assignment.
+  2. CMakeLists.txt: an edit silently stripped the file's UTF-8 BOM → restored; diff = 1 line.
+- FIRST PARITY RUN (uncontrolled): reasoning streams diverged at char ~19. NOT PROVEN A BUG —
+  confounded: head slices cost each peer ~162 MiB → ON boot filled 5464 experts/peer vs OFF's
+  5527; the engine's documented cache-parity semantics say different residency → replies may
+  differ slightly (GPU-vs-stream rounding paths). --expert-cache-device1..3 pinning is REFUSED
+  with --peer-devices ("the peer tier already caches experts there").
+- CONTROLLED GATE (battery3, running): OFF arm mirrors ON's peer VRAM via --peer-reserve-mib 930
+  (vs 768) → both must fill 5464/peer + main 2656 slots; driver VERIFIES residency equality from
+  both boots' engine-log sections and declares the gate INVALID on any mismatch. Probe = greedy
+  temp-0, 900 tokens (reasoning+content), byte-compare. Results: /tmp/hs_battery3_results.txt,
+  probes /tmp/hs2_{off,on}.txt, driver /tmp/hs_battery3.sh (configs hs-np1-{off,on}-pin.json).
+- IF PASS → np2 production battery: hs-np2-on.json (auto caches, production shape, owner's np2
+  call-out) — greedy exact-string, needle@40K verbatim, decode 2000-tok ×2 fresh boots vs winner
+  band 77-87 (target 93-95), pp salted (expect unchanged ~1830), 4-GPU util during decode (peers
+  should show head-stage bursts), draft-accept vs ~68% band. Then bank + owner adoption gate.
+- IF FAIL → debug the merge/logits (dump per-part val/idx vs a full-head argmax on one window);
+  owner directive: fix it, don't give up.
+- Lane note: battery3 owns :8190 (winner down during tests). Rollback stays
+  ~/strata-nvfp4/rollback-p3b-winner-20261011/ + tag golden-20261011-p3b-winner.
+- Script traps hit tonight: unquoted heredoc ate `$R` in a remote python patch (battery1's guard
+  never ran — driver died at a syntax error AFTER saving both probes); parity cmp must guard
+  against two EMPTY files comparing equal (battery1 would have false-passed). battery3 has both
+  guards. Kill+launch stay in separate ssh calls (self-SIGTERM trap).
+
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
      (~line 2039) + option field near peer_prefill_rows (~line 473). Semantics = the GGUF repo's:
