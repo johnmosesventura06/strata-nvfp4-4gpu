@@ -124,7 +124,24 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   Off by default; np1 only for now (batch still refuses session files, engine + server).
 - Rollback of the whole arm: RESTORE.sh bank + git tags; durable-KV lift = 1 commit, re-adding the refusal is trivial.
 
-## NVMe durability tier for the conversation cache — DESIGN (owner ask 10-10 04:19; GO pending)
+## NVMe durability tier for the conversation cache — SHIPPED (owner GO 10-10 10:12; commits 3-part, tag pending owner)
+
+Built exactly as designed below (it was right). Flags: --conversation-cache-dir DIR +
+--conversation-cache-disk-mib N (default 102400). BATTERY, all on the live np2@512K+vision lane
+(test cfg nvfp4-512k-np2-journal.json, cap 3000 to exercise pruning):
+- park -> journal: 4 conversations written on switch, 226-405 ms each (0.4-0.7 GB files, 0600, dir 0700)
+- restart -> load: "5 conversation(s) restored into the RAM cache, 0 refused, 2.2 GiB read in 858 ms"
+- MOUNT AFTER RESTART (the golden-lane claim): first request continues conversation A ->
+  "17466 tokens = 17461 reused + 5 read in 109 ms", answer "PINEAPPLE-42." correct, wall 0.4-0.6 s
+  (vs 11-12 s cold). np2 throughout: no control lines touched.
+- LRU prune: two prune lines, journal held under the 3 GiB cap (2.9 GiB left), oldest deleted first
+- corruption: one flipped payload byte mid-file -> "refused ... payload checksum mismatch", the
+  other five restored, engine healthy. Dedup: loading A-t1 + A-t2 parks both, put()'s
+  drop_superseded collapses the chain (5 restored -> parked=4) - correct.
+Adoption gate (owner): the flag pair is NOT yet in nvfp4-512k-np2-vision.json (production cfg).
+One line to add with the default 100 GiB cap + a restart; the lane currently runs the test cfg.
+
+## Original design (10-10 04:19, kept for the record)
 
 Golden-lane parity spec: ~100 GB on NVMe, oldest evicted, a session still inside it restores
 immediately after a restart instead of recomputing.
