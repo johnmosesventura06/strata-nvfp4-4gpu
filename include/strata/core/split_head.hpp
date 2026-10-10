@@ -37,15 +37,26 @@ public:
     int64_t end() const { return end_; }
     int64_t part_rows() const { return rows_; }
     uint64_t bytes() const { return bytes_; }
+    /// GPU-side protocol (phase 2.5): the verifier passes its assembled full-vocab buffer once its buffers bind.
+    /// With P2P to the main device, the part's window graph writes its logits rows straight into
+    /// `head_full[t][split..end)` (no mapped logits, no main-side join for this part) and pre-captures every
+    /// (T, logits) graph, which then starts with a wait-value on hand_dev() so the host can launch it at the
+    /// window's start instead of polling the handoff.  Precedence: call before any submit().
+    void set_target(float* head_full, int64_t n_vocab);
+    /// The part's handoff flag in ITS OWN device memory: the main's window graph bumps it (a one-word P2P write,
+    /// ordered after the mapped input rows), the part's graph wait-values on it and zeroes it in-graph.
+    uint32_t* hand_dev() const { return hand_dev_; }
+    bool gpu_protocol() const { return p2p_ok_; }
     /// Mapped: the head's input rows the main GPU writes (max_t x n_in floats) and the count it raises after them.
     float* input() const { return h_in_; }
     uint32_t* handoff() const { return h_hand_; }
-    /// Launches this GPU's part for a window of T tokens (after the handoff count has risen); `logits` copies its
-    /// rows to logits() too.
+    /// Launches this GPU's part for a window of T tokens.  gpu_protocol(): the graph waits on hand_dev() itself -
+    /// launch at the window's start, no host spin.  Otherwise: call after the handoff count has risen.
     bool submit(int T, bool logits, std::string& err);
     /// Until this GPU's count reaches `n` (the submits so far).
     bool wait(uint32_t n, std::string& err);
-    /// Per token: the pick's row within this part, its logit; T x (end - split) logits after a `logits` submit.
+    /// Per token: the pick's row within this part, its logit; with the mapped protocol, T x (end - split) logits
+    /// after a `logits` submit (the gpu protocol writes them into the target instead).
     const int32_t* idx() const { return h_idx_; }
     const float* val() const { return h_val_; }
     const float* logits() const { return h_logits_; }
@@ -60,6 +71,10 @@ private:
     void* w_ = nullptr;                                         // the rows' GGUF blocks
     float *mixed_ = nullptr, *out_ = nullptr;                   // device: the input, the logits
     uint8_t *xq_ = nullptr, *xil_ = nullptr, *scratch_ = nullptr;
+    uint32_t* hand_dev_ = nullptr;                              // device: the wait-value handoff flag
+    float* target_ = nullptr;                                   // the verifier's head_full_ (P2P logits rows)
+    int64_t target_n_ = 0;
+    bool p2p_ok_ = false;
     float* h_in_ = nullptr;                                     // mapped (portable)
     uint32_t *h_hand_ = nullptr, *h_done_ = nullptr;
     int32_t* h_idx_ = nullptr;

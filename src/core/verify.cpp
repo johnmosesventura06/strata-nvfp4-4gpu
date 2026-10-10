@@ -629,6 +629,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    if (n_shead_ > 0)   // head split: the parts write their P2P logits rows straight into the assembled buffer
+        for (int i = 0; i < n_shead_; ++i) sheads_[i]->set_target(head_full_, n_vocab_);
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -1666,10 +1668,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             // head split: hand the window's mixed rows to every part and raise its handoff — both graph-capturable
             // (a mapped copy + the bump kernel); the parts run on their GPUs while the main computes its range here.
+            // GPU protocol: the bump is a one-word P2P write into the part's own device flag, which its
+            // pre-launched graph wait-values on (threadfence_system in the bump orders it after the input rows).
             if (n_shead_ > 0) {
                 for (int si = 0; si < n_shead_; ++si) {
                     strata::kernels::copy_from_mapped(sheads_[si]->input(), head_mixed_, (int64_t) T * N, cs);
-                    strata::kernels::mapped_bump(sheads_[si]->handoff(), cs);
+                    strata::kernels::mapped_bump(sheads_[si]->gpu_protocol() ? sheads_[si]->hand_dev()
+                                                                             : sheads_[si]->handoff(),
+                                                 cs);
                 }
             }
             try {
@@ -2016,6 +2022,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     split_submitted_ = false;   // head split: this window's parts have not been submitted yet
+    // gpu protocol: pre-launch the parts now - their graphs wait-value on the main's in-graph bump, so they
+    // start without any host poll in between.  Mapped protocol: this is a no-op until the handoff rises.
+    if (n_shead_ > 0 && le_ == g.n_layers && !split_submit(T, err, false)) return false;
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -2749,6 +2758,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
+    if (n_shead_ > 0 && le_ == g.n_layers && !split_submit(S, err, false)) return false;   // gpu protocol: pre-launch
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
@@ -2921,25 +2931,29 @@ bool Verifier::split_logits_wanted() const {
 
 bool Verifier::split_submit(int T, std::string& err, bool block) {
     if (n_shead_ <= 0 || split_submitted_) return true;
-    if (!block) {   // the async poll: only once the window's handoffs have actually risen
-        for (int i = 0; i < n_shead_; ++i)
-            if (*(volatile uint32_t*) sheads_[i]->handoff() < hand_n_ + 1) return true;
-    }
-    ++hand_n_;
+    const bool gpu = sheads_[0]->gpu_protocol();
     const bool logits = split_logits_wanted();
-    for (int i = 0; i < n_shead_; ++i) {
-        if (block) {
-            const auto t0 = std::chrono::steady_clock::now();
-            while (*(volatile uint32_t*) sheads_[i]->handoff() < hand_n_) {
-                _mm_pause();
-                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
-                    err = "verify: a head part never saw the window's handoff";
-                    return false;
+    if (!gpu) {   // mapped protocol: the input rows must be down before the launch - block spins the handoff,
+        for (int i = 0; i < n_shead_; ++i) {   // the non-blocking variant returns until it has risen
+            if (!block) {
+                if (*(volatile uint32_t*) sheads_[i]->handoff() < hand_n_ + 1) return true;
+            } else {
+                const auto t0 = std::chrono::steady_clock::now();
+                while (*(volatile uint32_t*) sheads_[i]->handoff() < hand_n_ + 1) {
+                    _mm_pause();
+                    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
+                        err = "verify: a head part never saw the window's handoff";
+                        return false;
+                    }
                 }
             }
         }
-        if (!sheads_[i]->submit(T, logits, err)) { --hand_n_; return false; }
+        ++hand_n_;
     }
+    // gpu protocol: the graph wait-values on its own device flag - launching at the window's start costs one
+    // cudaGraphLaunch and the part begins the instant the main's in-graph bump lands.
+    for (int i = 0; i < n_shead_; ++i)
+        if (!sheads_[i]->submit(T, logits, err)) { if (!gpu) --hand_n_; return false; }
     split_submitted_ = true;
     return true;
 }
@@ -2963,11 +2977,12 @@ bool Verifier::split_merge(int T, std::string& err) {
         ((volatile int32_t*) h_out_)[t] = pick;
         ((volatile float*) h_val_)[t] = best;
     }
-    if (split_logits_wanted()) {   // assemble the full-vocab rows this window's samplers/logit readers use
+    if (split_logits_wanted()) {   // the main's rows into the assembled buffer; with the gpu protocol the
         strata::kernels::join_range(head_full_, n_vocab_, head_logits_, 0, head_rows_, head_rows_, T, cs_);
-        for (int i = 0; i < n_shead_; ++i)
-            strata::kernels::join_range(head_full_, n_vocab_, sheads_[i]->logits(), sheads_[i]->split(),
-                                        sheads_[i]->end(), sheads_[i]->part_rows(), T, cs_);
+        if (!sheads_[0]->gpu_protocol())   // parts' rows are already there (P2P writes before their done bumps)
+            for (int i = 0; i < n_shead_; ++i)
+                strata::kernels::join_range(head_full_, n_vocab_, sheads_[i]->logits(), sheads_[i]->split(),
+                                            sheads_[i]->end(), sheads_[i]->part_rows(), T, cs_);
     }
     split_submitted_ = false;
     return true;
@@ -2985,6 +3000,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
+    if (n_shead_ > 0 && le_ == g_->n_layers && !split_submit(S, err, false)) return false;   // gpu protocol: pre-launch
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) rows[t]];
