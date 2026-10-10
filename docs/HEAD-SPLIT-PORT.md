@@ -159,10 +159,25 @@ graph-compatible, measured +3-5% there._
   mirror missed SplitHead's per-peer DEVICE BUFFERS (~2.2 MiB: out_ 8×rows×4 + mixed_/xq_/xil_).
   Uncontrolled probes differed again (1498 vs 1544 B) — consistent with residency confound, NOT
   evidence of a merge bug.
-- BATTERY4 (launched 04:50): frac 0.7515 → split0 = 61696 → three EXACT 62208-row parts (equal
-  MiB; 248320 mod 768 = 256 so this is the alignment family that divides evenly); OFF reserve 933.
-  Results /tmp/hs_battery4_results.txt, configs hs-np1-{off,on}-pin4.json. Residency guard must
-  show identical counts (expect 5464×3 both arms) before the byte-compare counts.
+- BATTERY4 (04:48-05:00, frac 0.7515 = three exact 62208-row parts, OFF reserve 933): residency
+  MATCHED perfectly (2656 slots + 5464×3 both arms — the mirror recipe works), gate controlled —
+  and **FAILED**: reasoning diverged at char 19 identically to the uncontrolled run ("We need
+  answer user's request:" vs "We need answer user:"). Same divergence point across different
+  residency = systematic, not rounding.
+- **ROOT CAUSE FOUND (commit: 'head-split fix: disable T==1 in-graph self-commit')**:
+  `one_token_self_commit()` is an NVFP4-FORK feature the GGUF reference never had (grep = zero
+  hits there), so the port missed it. A T==1 window's captured graph commits the pick into
+  session state IN-GRAPH — under split that pick is the main's ranged argmax over [0, 61696)
+  only, before the host merge corrects h_out_. Windows average 1.68 rows → T==1 windows are
+  frequent → state corrupted within the first tokens whenever the true argmax lands in a peer
+  range. Fix: both gates (record_window capture ~755, Verifier::commit skip ~2382) now require
+  `n_shead_ == 0`; split T==1 windows take the host commit path with the merged pick.
+  Cost: one commit-graph launch per T==1 window (what every T>1 window already pays).
+- BATTERY5 (launched ~05:00): battery4 + `STRATA_ONE_TOKEN_COMMIT=0` env on BOTH arms so the
+  commit path is identical too — the gate then tests ONLY the split mechanism. Configs
+  hs-np1-{off,on}-pin5.json, results /tmp/hs_battery5_results.txt, probes /tmp/hs5_{off,on}.txt.
+  Note for production: with the code fix, split boots never self-commit regardless of the env;
+  the env is only the parity control.
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
