@@ -151,7 +151,18 @@ graph-compatible, measured +3-5% there._
 - Script traps hit tonight: unquoted heredoc ate `$R` in a remote python patch (battery1's guard
   never ran — driver died at a syntax error AFTER saving both probes); parity cmp must guard
   against two EMPTY files comparing equal (battery1 would have false-passed). battery3 has both
-  guards. Kill+launch stay in separate ssh calls (self-SIGTERM trap).
+  guards. Kill+launch stay in separate ssh calls (self-SIGTERM trap). Owner rule 04:39: no
+  sleep/poll > 3 min, detached probes only.
+- BATTERY3 RESULT (04:37-04:47): gate machinery WORKED — residency guard INVALIDATED the run:
+  OFF@reserve930 = 5465/5465/5465 experts vs ON@768 = 5464/5464/5463. Two causes: the last head
+  part absorbs the 256-alignment remainder (162 vs 161 MiB → GPU3 one extra expert lost), and the
+  mirror missed SplitHead's per-peer DEVICE BUFFERS (~2.2 MiB: out_ 8×rows×4 + mixed_/xq_/xil_).
+  Uncontrolled probes differed again (1498 vs 1544 B) — consistent with residency confound, NOT
+  evidence of a merge bug.
+- BATTERY4 (launched 04:50): frac 0.7515 → split0 = 61696 → three EXACT 62208-row parts (equal
+  MiB; 248320 mod 768 = 256 so this is the alignment family that divides evenly); OFF reserve 933.
+  Results /tmp/hs_battery4_results.txt, configs hs-np1-{off,on}-pin4.json. Residency guard must
+  show identical counts (expect 5464×3 both arms) before the byte-compare counts.
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
