@@ -77,4 +77,95 @@ graph-compatible, measured +3-5% there._
 
 - 10-11 03:0x: design written (this file). Reference read: split_head.{hpp,cpp} full, verify.cpp
   integration lines 162-170/985-1001/1304-1346/1388, verify_kernels.cu mapped_bump/join_range/
-  argmax-val. NVFP4 kernel parity confirmed except the three ported primitives. NEXT: phase 1.
+  argmax-val. NVFP4 kernel parity confirmed except the three ported primitives.
+
+### DONE (committed on nvfp4-4gpu, laptop scratch ~/.hermes/cache/scratch/strata-nvfp4)
+
+- **P1 = 572b84c**: split_head.{hpp,cpp} ported near-verbatim (adapted: quantize+interleave are TWO
+  calls in this tree, gated on native_mmvq_il_supported — no fused native_quantize_q8_1_il here);
+  verify_kernels.cu/.hpp += mapped_bump, join_range, argmax_rows out_val param (+ non-CUDA stubs);
+  split_head.cpp into CMakeLists strata_engine (line ~448). COMPILES+LINKS on ai-host (ninja log
+  /tmp/ninja-headsplit-p1.log). Parity tool gcc15 f16c fix = bde25db (earlier commit).
+- **P2 = f5e4d4c (WIP)**: verify.hpp — include split_head.hpp; public set_split_heads(arr,n)/
+  split_heads() (NO next_ propagation — last stage only); private members sheads_[3]/n_shead_/
+  head_rows_/head_full_/h_val_+m_val_(mapped)/hand_n_/done_n_/split_submitted_ + split_submit(T,err,
+  block)/split_merge(T,err)/split_logits_wanted(). verify.cpp —
+  * init: m_val_ mapped alloc (after the mapped-staging ok check); head_full_ = b.take (beside
+    head_logits_ ~line 590); tiling validation + "split needs the native head" refusal (right after
+    `head_ = head;` ~line 428); head_rows_ = sheads_[0]->split() or n_vocab_.
+  * record_window head stage (~1660): per-part copy_from_mapped(input(), head_mixed_, T*N) +
+    mapped_bump(handoff()) BEFORE the main's compute; main mmvq ranged to head_rows_; pick =
+    `argmax_rows_wanted() || n_shead_ > 0` → argmax_rows(..., head_rows_, ..., m_val_) (bitwise the
+    greedy sample_tokens pick per its contract — sm_120 otherwise uses sample_tokens greedy which
+    has NO val output).
+  * helpers after sample_rows (~2890): split_logits_wanted (batch: any slot sampler via
+    slot_sp_[last_rows_[t]]; solo: sampling_/hist_d_), split_submit (block=true spins handoff ≤20s;
+    block=false checks once — for batch_poll), split_merge (submits-if-missed, waits done_n_, merges
+    picks: max val, tie→lower GLOBAL index = bitwise full-head greedy; assembles head_full_ via
+    join_range main + per-part when logits wanted; clears split_submitted_).
+  * hooks: run() — reset at launch, submit(block) before the final SYNC (overlap = parts run while
+    main finishes its ranged head), merge after collect_profile/before the layer-split early-return;
+    samplers at ~2182/2189 read `lg`. run_slot_rows — reset after stage_batch, submit+merge in BOTH
+    the ar_on flow (~2756) and the doorbell flow (~2815), merge before sample_rows. batch_launch —
+    reset after stage_batch. batch_poll (THE np2 async production path) — non-blocking submit after
+    the doorbell loop before the stream-query (parts overlap the main's head+commit graphs), merge
+    before sample_rows in the finished branch. pl_finish — merge (submits itself; window already
+    done) + sampler reads head_full_. sample_rows/copy_logits/window_logprobs consumers switched;
+    window_logprobs+copy_logits REFUSE when split && !logits_wanted (head_full_ not assembled for
+    greedy windows — honest error, not garbage; serve doesn't use them on this lane).
+  * run() DBG_NAN D2H (~2202) still reads head_logits_ = main part only (debug aid, acceptable).
+
+### LEFT (resume here)
+
+1. **P3 wiring — generate.cpp** (the ONLY missing code):
+   - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
+     (~line 2039) + option field near peer_prefill_rows (~line 473). Semantics = the GGUF repo's:
+     FRAC of the vocab rows OFFLOADED; main keeps [0, n_vocab*(1-FRAC)) aligned DOWN to a 256-row
+     boundary; parts tile the rest evenly across min(3, live peers), each aligned to 256 rows.
+   - REFUSE at boot unless: --native-head-gguf set (the mixed-rows handoff needs the native head
+     path; the measured p3b-nativehead arm proved it loads from orca-nvfp4-dense.gguf, perf-neutral)
+     AND peers exist (--peer-devices). Clear error strings.
+   - Build SplitHeads after native_head.load (~line 4366-4375) + after the PeerExperts array exists:
+     `SplitHead::init(peer_dev, main_dev, o.native_head_shards, g.n_embd, n_vocab, split_i, max_t=8,
+     err, end_i)`; log a line per part (rows X-Y on GPU N, Z MiB) like the GGUF repo's.
+   - `ver.set_split_heads(shp, n)` at EVERY Verifier construction BEFORE its init() (validation is
+     in init). Find sites: grep "Verifier " / ".init(" in generate.cpp — the GGUF reference had two
+     (serve path ~2683, generate path ~3550 in ITS numbering).
+   - Reference block to port: /tmp/strata-4gpu-pub/src/program/generate.cpp lines 1572-1611 (build
+     loop, 256-row boundaries, MiB log). If /tmp was wiped: `git clone --depth 1
+     https://github.com/johnmosesventura06/strata-4gpu /tmp/strata-4gpu-pub`.
+2. **Build**: sync changed files to ai-host ~/strata-nvfp4/strata (scp each), `ninja -C build strata`
+   (~3-5 min; CUDA TU verify_kernels.cu only if touched again). NO cppgate (compile_commands.json
+   covers only llama.cpp — ninja IS the syntax check).
+3. **Battery** (test configs from p3b-on.json + `--native-head-gguf ../models/orca-nvfp4/orca-nvfp4-dense.gguf`
+   + `--head-split 0.75`; np1 variant first (drop --batch/parallel) to exercise run() solo, then np2
+   production shape per owner call-out):
+   - ACCEPTANCE GATE: greedy (temp 0) token stream split-ON must be BYTE-IDENTICAL to split-OFF for
+     the same prompt+seed (the merge is bitwise the full-head pick — anything else = bug, fix before
+     anything else; owner law: confidently-wrong = disqualifier, "fix it before giving up").
+   - exact-string greedy, needle@40K (ZEBRA pattern, verbatim), draft-accept vs ~68% band,
+     decode 2000-tok ×2 fresh boots vs winner band 77-87 (target 93-95), pp unchanged check (~1830).
+   - Watch first-request capture time (peer mini-graphs capture lazily per (T,logits) — first windows
+     slightly slower; the GGUF lane had the same shape).
+4. **Bank/adopt**: winner rollback stays ~/strata-nvfp4/rollback-p3b-winner-20261011/ (RESTORE.sh,
+   binary md5 20a821e5...) + tag golden-20261011-p3b-winner. On success: new tag, config of record
+   update (owner gate), vault + skill strata-4gpu-lane-ops.
+
+### Environment facts (resume-safe)
+
+- Lane :8190 LIVE = winner (p3b-on.json, pre-P1 winner binary still the RUNNING process; build/strata
+  on disk = P1 build, behavior-identical until wiring lands). Health: http://100.71.205.101:8190/health
+  (binds tailnet IP only, NOT 127.0.0.1). Bench/probe pattern: salted prompts, engine log
+  `strata serve: prompt ...` lines = ground truth (log SHARED across boots — anchor on the
+  "engine started" marker line before quoting).
+- Boot recipe: kill resolved PIDs (separate ssh call from launch — compound lines self-SIGTERM,
+  fired twice tonight), wait all cards <200MiB, `nohup setsid python3 serve/server.py --engine
+  strata --config configs/X.json --port 8190 > /tmp/BOOT-X.log 2>&1 < /dev/null &` via
+  run_in_background tool call, poll health (warm boots ~50s, cold ~4min).
+- Session is CLOUD-served (qwen3.8-max) → lane restarts safe. Verify before assuming.
+- Head facts: output.weight Q8_0 [2560, 248320] = 675,430,400 B in orca-nvfp4-dense.gguf; native
+  head boot line "experimental native Q5_K head, 675430400 bytes"; head ≈13% of decode round
+  (T_avg 1.68 rows × 675MB / 430GB/s ≈ 2.6ms of 19.8ms); kVerifyMaxT=8; peer free VRAM ~468MiB
+  (parts at frac 0.75 ≈ 169MB each — fits; frac higher or reserve tighter → re-check).
+- Owner directives in force: np2 is the production shape (design for it, test it); "if you hit the
+  risk zone, find a way to fix it and make it work first before giving up"; adoption = his gate.
