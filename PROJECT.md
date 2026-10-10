@@ -138,8 +138,9 @@ Built exactly as designed below (it was right). Flags: --conversation-cache-dir 
 - corruption: one flipped payload byte mid-file -> "refused ... payload checksum mismatch", the
   other five restored, engine healthy. Dedup: loading A-t1 + A-t2 parks both, put()'s
   drop_superseded collapses the chain (5 restored -> parked=4) - correct.
-Adoption gate (owner): the flag pair is NOT yet in nvfp4-512k-np2-vision.json (production cfg).
-One line to add with the default 100 GiB cap + a restart; the lane currently runs the test cfg.
+ADOPTED 10-10 11:30 (owner GO): --conversation-cache-dir journal is in the production cfg (100 GiB
+default cap; test journal files wiped at cutover). Prod verification: boot restored 4/2.0 GiB/776 ms,
+first request after restart 17461/17466 reused, 0.6 s wall, correct answer. Tag journal-adopted-20261010.
 
 ## Original design (10-10 04:19, kept for the record)
 
