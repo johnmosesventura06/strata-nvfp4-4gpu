@@ -606,6 +606,12 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// The NVMe journal for the conversation cache (durability arm): parked conversations are ALSO written to
+    /// DIR as STRSESS v1 files (fingerprint-bound, atomic temp+rename), and a fresh engine reads them back
+    /// newest-first into the RAM cache - so a conversation whose file is still inside the cap restores after a
+    /// restart instead of re-prefilling (the golden lane's journal semantics). Needs the RAM cache on.
+    std::string conversation_cache_dir;
+    int64_t conversation_cache_disk_mib = 102400;   ///< the journal's byte cap: the oldest files are pruned first
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -750,6 +756,11 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
+                 "  --conversation-cache-dir DIR  --serve: also journal every parked conversation to DIR (on NVMe)\n"
+                 "                       and load the journal back at start: a conversation still inside the cap\n"
+                 "                       restores after a restart instead of re-reading its prompt. Needs --conversation-cache-mib.\n"
+                 "  --conversation-cache-disk-mib N  the journal's cap in GiB-scale MiB (default 102400 = 100 GiB):\n"
+                 "                       past it the oldest files are pruned\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -1936,6 +1947,8 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = std::atoll(next("--conversation-cache-disk-mib"));
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
@@ -7409,6 +7422,126 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // ---- the NVMe journal for the conversation cache (--conversation-cache-dir). Parked conversations are
+        // ALSO written to the folder as STRSESS v1 files (the disk-session format: fingerprint-bound, hash-checked,
+        // atomic temp+rename), and a fresh engine reads them back newest-first into the RAM cache. A conversation
+        // whose file survived is then mounted by the ordinary prefix lookup instead of re-reading its prompt -
+        // the golden lane's journal semantics on the conversation cache. All of it runs on the park path and at
+        // boot: no control lines, so it is sound with --batch slots too.
+        size_t journal_pruned = 0;
+        auto journal_prune = [&] {
+            const uint64_t cap = (uint64_t) std::max<int64_t>(1024, o.conversation_cache_disk_mib) << 20;
+            std::error_code ec;
+            uint64_t total = 0;
+            std::vector<std::pair<std::filesystem::file_time_type, std::pair<uint64_t, std::string>>> fs;
+            for (auto& de : std::filesystem::directory_iterator(o.conversation_cache_dir, ec))
+                if (de.is_regular_file(ec) && de.path().filename().string().rfind("conv-", 0) == 0) {
+                    const uint64_t sz = (uint64_t) de.file_size(ec);
+                    total += sz;
+                    fs.emplace_back(de.last_write_time(ec), std::make_pair(sz, de.path().string()));
+                }
+            if (total <= cap) return;
+            std::sort(fs.begin(), fs.end());          // oldest first
+            for (auto& [mt, sp] : fs) {
+                if (total <= cap) break;
+                std::error_code rec;
+                if (std::filesystem::remove(sp.second, rec) && !rec) {
+                    total -= sp.first;
+                    ++journal_pruned;
+                }
+            }
+            std::fprintf(stderr, "strata serve: conversation journal: pruned to the cap, %zu file(s) deleted, %.1f GiB left\n",
+                         journal_pruned, (double) total / (1u << 30));
+        };
+        auto journal_write = [&](const strata::core::SavedConversation& image, size_t snapshot_bytes) {
+            (void) snapshot_bytes;
+            strata::core::SessionFileIdentity jid;
+            std::string e;
+            if (!session_identity(jid, e, [] {})) {
+                std::fprintf(stderr, "strata serve: conversation journal: no identity (%s); skipped\n", e.c_str());
+                return;
+            }
+            uint64_t h = 1469598103934665603ULL;      // FNV-1a over the fingerprints and the parked prefix's ids
+            auto mix = [&h](uint64_t v) { for (int b = 0; b < 8; ++b) { h ^= (v >> (b * 8)) & 0xFF; h *= 1099511628211ULL; } };
+            mix(jid.model);
+            mix(jid.config);
+            for (const int32_t id : image.live.ids) mix((uint64_t) (uint32_t) id);
+            char name[40];
+            std::snprintf(name, sizeof name, "/conv-%016llx.bin", (unsigned long long) h);
+            const std::string path = o.conversation_cache_dir + name;
+            strata::core::SessionWriteOptions wo;
+            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+            size_t written = 0;
+            std::string jerr;
+            const auto t0j = Clock::now();
+            if (!strata::core::session_file_write(path, image, jid, written, jerr, wo)) {
+                std::fprintf(stderr, "strata serve: conversation journal: write failed (%s); RAM park unaffected\n", jerr.c_str());
+                return;
+            }
+            std::fprintf(stderr, "strata serve: conversation journal: wrote %zu tokens, %.1f GiB in %.0f ms\n",
+                         (size_t) image.live.ids.size(), (double) written / (1u << 30),
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0j).count());
+            journal_prune();
+        };
+        auto journal_load = [&] {
+            std::error_code ec;
+            std::filesystem::create_directories(o.conversation_cache_dir, ec);
+            if (ec || !std::filesystem::is_directory(o.conversation_cache_dir, ec)) {
+                std::fprintf(stderr, "strata serve: conversation journal: %s is not a usable directory; starting empty\n",
+                             o.conversation_cache_dir.c_str());
+                return;
+            }
+            std::vector<std::pair<std::filesystem::file_time_type, std::string>> fs;
+            for (auto& de : std::filesystem::directory_iterator(o.conversation_cache_dir, ec))
+                if (de.is_regular_file(ec) && de.path().filename().string().rfind("conv-", 0) == 0)
+                    fs.emplace_back(de.last_write_time(ec), de.path().string());
+            std::sort(fs.rbegin(), fs.rend());        // newest first: the freshest conversations get the RAM
+            strata::core::SessionFileIdentity jid;
+            std::string e;
+            if (!session_identity(jid, e, [] {})) {
+                std::fprintf(stderr, "strata serve: conversation journal: no identity (%s); skipped\n", e.c_str());
+                return;
+            }
+            strata::core::SessionReadLimits limits;
+            limits.max_file_bytes = (uint64_t) std::max<int64_t>(1024, o.conversation_cache_disk_mib) << 20;
+            const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+            limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                const auto avail = strata::core::conversation_available_memory();
+                if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus the floor)";
+                return false;
+            };
+            if (!strata::core::conversation_session_read_limits(
+                    limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                    (uint64_t) std::max(o.prompt_cache, 1), e)) {
+                std::fprintf(stderr, "strata serve: conversation journal: limits failed (%s); skipped\n", e.c_str());
+                return;
+            }
+            size_t ok = 0, rej = 0, kept = 0;
+            uint64_t rb = 0;
+            const auto t0l = Clock::now();
+            for (auto& [mt, path] : fs) {
+                strata::core::SavedConversation img;
+                size_t bytes_read = 0;
+                std::string rerr;
+                if (!strata::core::session_file_read(path, jid, img, bytes_read, rerr, limits)) {
+                    ++rej;
+                    std::fprintf(stderr, "strata serve: conversation journal: refused %s (%s)\n", path.c_str(), rerr.c_str());
+                    continue;
+                }
+                rb += bytes_read;
+                if (conversations.put(std::move(img))) ++ok;
+                else ++kept;                          // RAM cache full: the file stays, a later park may free room
+            }
+            std::fprintf(stderr, "strata serve: conversation journal: %zu conversation(s) restored into the RAM cache, "
+                                 "%zu on disk (cache full), %zu refused, %.1f GiB read in %.0f ms; parked=%zu bytes=%zu\n",
+                         ok, kept, rej, (double) rb / (1u << 30),
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0l).count(),
+                         conversations.size(), conversations.bytes());
+        };
+        if (!o.conversation_cache_dir.empty() && conversations.enabled()) journal_load();
+        else if (!o.conversation_cache_dir.empty())
+            std::fprintf(stderr, "strata serve: --conversation-cache-dir needs --conversation-cache-mib > 0; the journal is off\n");
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
@@ -7540,6 +7673,8 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                if (!o.conversation_cache_dir.empty() && conversations.enabled())
+                    journal_write(image, snapshot_bytes);   // the NVMe copy rides the park, before the image moves
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
