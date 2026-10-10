@@ -2984,6 +2984,68 @@ bool Verifier::split_merge(int T, std::string& err) {
                 strata::kernels::join_range(head_full_, n_vocab_, sheads_[i]->logits(), sheads_[i]->split(),
                                             sheads_[i]->end(), sheads_[i]->part_rows(), T, cs_);
     }
+    // STRATA_DBG_SPLIT_VERIFY (test-only): the in-boot proof, immune to cross-boot noise - recompute the FULL
+    // head on the main with the same kernels the unsplit path runs (xq_/xil_ still hold this window's
+    // quantized rows; the window stream is synced) and compare.  Level 1: every merged pick against the full
+    // head's argmax.  Level 2: also memcmp the assembled/P2P-written full-vocab rows against the recomputed
+    // ones, bitwise.  Silence across a run = the split is exact; any mismatch names the window, row and picks.
+    static const int dbg_sv = std::getenv("STRATA_DBG_SPLIT_VERIFY") ? std::atoi(std::getenv("STRATA_DBG_SPLIT_VERIFY")) : 0;
+    if (dbg_sv > 0 && head_ != nullptr && head_->loaded()) {
+        using namespace strata::kernels;
+        const int64_t N = g_->n_embd;
+        static int32_t* dbg_ids = nullptr;
+        static float* dbg_full = nullptr;
+        if (dbg_ids == nullptr && cudaMalloc((void**) &dbg_ids, (size_t) max_t_ * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            dbg_ids = nullptr;
+        }
+        if (dbg_sv > 1 && dbg_full == nullptr &&
+            cudaMalloc((void**) &dbg_full, (size_t) max_t_ * (size_t) n_vocab_ * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            dbg_full = nullptr;
+        }
+        float* full = dbg_sv > 1 && dbg_full != nullptr ? dbg_full : head_full_;
+        if (dbg_ids != nullptr) {
+            try {
+                if (g_mmvq_il() && native_mmvq_il_supported(head_->type(), T, (int) n_vocab_)) {
+                    // xil_ may be stale when the window's ranged path took the plain branch (il support can
+                    // differ between head_rows_ and n_vocab_): re-interleave from xq_, which both paths wrote.
+                    strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, T, cs_);
+                    native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, full, (int) N, (int) n_vocab_, T, cs_);
+                } else
+                    native_mmvq(head_->type(), head_->weights(), xq_, full, (int) N, (int) n_vocab_, T, cs_);
+                argmax_rows(full, T, (int) n_vocab_, arg_scratch_, dbg_ids, cs_);
+                if (cudaStreamSynchronize(cs_) == cudaSuccess) {
+                    std::vector<int32_t> ids((size_t) T);
+                    if (cudaMemcpy(ids.data(), dbg_ids, (size_t) T * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
+                        for (int t = 0; t < T; ++t) {
+                            const int32_t got = ((volatile int32_t*) h_out_)[t];
+                            if (ids[(size_t) t] != got)
+                                std::fprintf(stderr,
+                                             "strata dbg: SPLIT MISMATCH window %lld row %d: the full head picks %d, "
+                                             "the merge picked %d\n",
+                                             (long long) windows, t, ids[(size_t) t], got);
+                        }
+                    if (dbg_sv > 1 && dbg_full != nullptr && full == dbg_full && split_logits_wanted()) {
+                        std::vector<float> a((size_t) T * (size_t) n_vocab_), b(a.size());
+                        if (cudaMemcpy(a.data(), head_full_, a.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                            cudaMemcpy(b.data(), dbg_full, b.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
+                            for (size_t i = 0; i < a.size(); ++i)
+                                if (std::memcmp(&a[i], &b[i], 4) != 0) {
+                                    std::fprintf(stderr,
+                                                 "strata dbg: SPLIT LOGITS MISMATCH window %lld row %zu col %zu: "
+                                                 "assembled %g, recomputed %g\n",
+                                                 (long long) windows, i / (size_t) n_vocab_, i % (size_t) n_vocab_,
+                                                 (double) a[i], (double) b[i]);
+                                    break;
+                                }
+                    }
+                }
+            } catch (const std::exception& x) {
+                std::fprintf(stderr, "strata dbg: the split verify recompute failed: %s\n", x.what());
+            }
+        }
+    }
     split_submitted_ = false;
     return true;
 }
