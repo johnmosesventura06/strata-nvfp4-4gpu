@@ -253,9 +253,26 @@ graph-compatible, measured +3-5% there._
   draft-accept 53/75 = 70.7% (band ✓). The battery's one-off ×3 False DID NOT REPRODUCE; it was
   reasoning-only drift of the same class as the proven engine boot-nondeterminism (content never
   wavered). Item logged honestly as a one-off; the repro passes.
-- FINAL A/B (launched 06:27, /tmp/hs_ab_final.txt): interleaved fresh boots, SAME binary,
-  W=p3b-on vs S=hs-np2-on, 3 rounds, decode-2000 (same essay prompt) + per-boot draft-accept
-  tally. Verdict rule: split median vs winner median; adoption needs a clear margin (owner gate).
+- FINAL A/B (06:27-06:46, /tmp/hs_ab_final.txt): interleaved fresh boots, SAME binary,
+  W=p3b-on vs S=hs-np2-on, decode-2000 same essay prompt:
+  | round | W | S | Δ |
+  |---|---|---|---|
+  | 1 | 98.7 (acc 72.4%) | 101.0 (acc 69.1%) | +2.3% (S handicapped) |
+  | 2 | 96.9 (acc 70.4%) | 104.8 (acc 74.2%) | +8.2% |
+  | 3 | 96.3 (acc 69.0%) | 105.3 (acc 72.2%) | +9.3% |
+  **Median +8.2% (S 104.8 vs W 96.9), every pair positive, accepts comparable.** Draft-accept
+  both arms 69-74% = band. S trajectory tonight: 82.6 (mapped protocol) → 97.6 (P2.5 w/ dbg) →
+  97.9 → 101.0 → 104.8 → 105.3.
+- BASELINE DRIFT NOTE (independent of this port): this morning's W arm (96.3-98.7) sits ~+14%
+  over yesterday's winner band (77-87) with the same winner config — unexplained (journal state /
+  accept drift / environment); the interleaved same-morning design controls for it, but yesterday's
+  band should not be quoted as today's baseline without a re-measure. The W arm ran the split
+  BINARY with all split code dead (n_shead_=0 gates) — a winner-binary re-measure would fully
+  close the binary variable if the drift question matters.
+- STATUS: correctness gate MET (in-boot bitwise, witnessed), quality gates green (needle verbatim,
+  pp 1829.7 band, exact-string 6/6 repro, accept band), speed +8.2% median interleaved.
+  ADOPTION = owner gate. Lane left running hs-np2-on (S) for the feel-test.
+  Banked: tag + ~/strata-nvfp4/rollback-headsplit-20261011/ (see vault).
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
