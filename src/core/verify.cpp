@@ -752,7 +752,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
-    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // head split: with parts, the in-graph pick is the MAIN's ranged argmax only - the merged pick exists only
+    // host-side after the window, so a T==1 window must take the host commit path (Verifier::commit below matches).
+    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && n_shead_ == 0 && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
@@ -2379,8 +2381,9 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && one_token_self_commit()) {
+    if (last_t_ == 1 && n_shead_ == 0 && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
+        // (head split: never - its in-graph pick is unmerged, so the commit graph runs with the merged tokens)
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
