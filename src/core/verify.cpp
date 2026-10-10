@@ -426,27 +426,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     ss_ = &ss;
     hits_ = hits;
     head_ = head;
-    // head split: the main keeps rows [0, split) of the head compute (its weights stay whole - native_mmvq's
-    // n_out bounds the read), and the parts must tile [split, n_vocab) in order, gapless, to the vocab end.
-    if (n_shead_ > 0) {
-        if (head_ == nullptr || !head_->loaded()) {
-            err = "verify: the head split needs the native head (--native-head-gguf)";
-            return false;
-        }
-        head_rows_ = sheads_[0]->split();
-        int64_t pos = head_rows_;
-        for (int i = 0; i < n_shead_; ++i) {
-            if (sheads_[i] == nullptr || sheads_[i]->split() != pos || sheads_[i]->end() > n_vocab_) {
-                err = "verify: the head parts must tile [" + std::to_string(head_rows_) + ", " +
-                      std::to_string(n_vocab_) + ") without gaps";
-                return false;
-            }
-            pos = sheads_[i]->end();
-        }
-        if (pos != n_vocab_) { err = "verify: the head parts do not reach the vocabulary's end"; return false; }
-    } else {
-        head_rows_ = n_vocab_;
-    }
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
@@ -480,6 +459,29 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
+    // head split: the main keeps rows [0, split) of the head compute (its weights stay whole - native_mmvq's
+    // n_out bounds the read), and the parts must tile [split, n_vocab) in order, gapless, to the vocab end.
+    // AFTER n_vocab_ is known (the first placement of this block preceded the assignment above and validated
+    // against n_vocab_ == 0 - caught by the np1 parity boot: "tile [61952, 0)").
+    if (n_shead_ > 0) {
+        if (head_ == nullptr || !head_->loaded()) {
+            err = "verify: the head split needs the native head (--native-head-gguf)";
+            return false;
+        }
+        head_rows_ = sheads_[0]->split();
+        int64_t pos = head_rows_;
+        for (int i = 0; i < n_shead_; ++i) {
+            if (sheads_[i] == nullptr || sheads_[i]->split() != pos || sheads_[i]->end() > n_vocab_) {
+                err = "verify: the head parts must tile [" + std::to_string(head_rows_) + ", " +
+                      std::to_string(n_vocab_) + ") without gaps";
+                return false;
+            }
+            pos = sheads_[i]->end();
+        }
+        if (pos != n_vocab_) { err = "verify: the head parts do not reach the vocabulary's end"; return false; }
+    } else {
+        head_rows_ = n_vocab_;
+    }
 
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);

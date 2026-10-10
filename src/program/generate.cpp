@@ -21,6 +21,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/split_head.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -471,6 +472,10 @@ struct Options {
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
+    /// head split (docs/HEAD-SPLIT-PORT.md): the fraction of the output head's vocabulary rows OFFLOADED to the
+    /// peer GPUs for the verify windows (0 = off; the main keeps [0, (1-frac) x n_vocab), the peers tile the rest).
+    /// Needs --native-head-gguf, --peer-devices and --spec >= 2.
+    double head_split = 0.0;
     /// The PLE gather's prefetch, as an A/B arm.  The gather measured 2.10-2.61 ms/token because its sixteen
     /// row reads are sixteen SEPARATE page faults into a 26.8 GB mapping; see `ple_prefetch_enable`.
     bool no_ple_prefetch = false;
@@ -857,6 +862,11 @@ void usage() {
                   "                       beside the others' holdings.  Each also computes its held experts' prompt\n"
                   "                       rows (--peer-prefill-rows, split across them); the streamed ring and the\n"
                   "                       sums route stay with a single --peer-device.  The same refusals apply.\n"
+                  "  --head-split FRAC    the verify windows' output head across the tier GPUs (docs/HEAD-SPLIT-PORT.md):\n"
+                  "                       FRAC of the vocabulary's rows offload, one contiguous part per tier (256-row\n"
+                  "                       boundaries); the main computes the rest.  The host merge is bitwise the\n"
+                  "                       full-head greedy pick.  Needs --native-head-gguf, --peer-devices and\n"
+                  "                       --spec >= 2; 0 (the default) leaves every window on the main GPU.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
@@ -2037,6 +2047,7 @@ int main(int argc, char** argv) {
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
+        else if (a == "--head-split") o.head_split = std::atof(next("--head-split"));
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
@@ -4370,6 +4381,50 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes, in %.1f s\n",
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
+    }
+    // ---- the head split (docs/HEAD-SPLIT-PORT.md): the head's tail rows, one contiguous part per tier GPU.
+    // The main keeps its whole weights and computes only [0, split0) a window (native_mmvq's n_out bounds the
+    // read - no truncation, so the draft head and every consumer keep seeing the full table); each part runs
+    // its range on its own GPU from the mapped-handoff inputs and returns per-row picks (plus its logits for
+    // sampling windows); the host merge is bitwise the full-head greedy pick.
+    std::vector<std::unique_ptr<strata::core::SplitHead>> split_heads;
+    if (o.head_split > 0.0) {
+        if (o.head_split >= 1.0 || o.native_head_gguf.empty() || !native_head.loaded()) {
+            std::fprintf(stderr, "strata generate: --head-split needs a fraction < 1 and --native-head-gguf loaded "
+                                 "(the window handoff is the native head's mixed rows)\n");
+            return 1;
+        }
+        if (o.peer_devices.empty() || o.spec < 2) {
+            std::fprintf(stderr, "strata generate: --head-split needs --peer-devices and --spec >= 2 (verify windows)\n");
+            return 1;
+        }
+        const int sh_parts = (int) std::min<size_t>(o.peer_devices.size(), (size_t) 3);
+        const int64_t split0 = (int64_t) ((1.0 - o.head_split) * (double) n_vocab) / 256 * 256;
+        const int64_t per = split0 > 0 ? (n_vocab - split0) / sh_parts / 256 * 256 : 0;
+        int main_dev = 0;
+        cudaGetDevice(&main_dev);
+        std::string e2;
+        bool sh_ok = per > 0;
+        if (!sh_ok) e2 = "the fraction leaves no 256-row-aligned parts";
+        std::vector<std::unique_ptr<strata::core::SplitHead>> built;
+        for (int i = 0; sh_ok && i < sh_parts; ++i) {
+            const int64_t lo = split0 + per * i;
+            const int64_t hi = (i + 1 == sh_parts) ? n_vocab : split0 + per * (i + 1);
+            auto sh = std::make_unique<strata::core::SplitHead>();
+            sh_ok = sh->init(o.peer_devices[(size_t) i], main_dev, o.native_head_shards, g.n_embd, n_vocab, lo,
+                             strata::kernels::kVerifyMaxT, e2, hi);
+            if (sh_ok) {
+                std::fprintf(stderr, "strata generate: the head's rows %lld-%lld on GPU %d (%.0f MiB)\n",
+                             (long long) lo, (long long) hi, o.peer_devices[(size_t) i],
+                             (double) sh->bytes() / 1048576.0);
+                built.push_back(std::move(sh));
+            }
+        }
+        if (!sh_ok) {
+            std::fprintf(stderr, "strata generate: --head-split refused: %s\n", e2.c_str());
+            return 1;
+        }
+        split_heads = std::move(built);
     }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
@@ -7187,6 +7242,12 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        {   // head split: this verifier's windows hand their mixed rows to the parts (set before init - the
+            // tiling is validated there).  The layer-split/pipeline verifiers stay unsplit by design (v1).
+            strata::core::SplitHead* shp[3] = {};
+            for (size_t i = 0; i < split_heads.size() && i < 3; ++i) shp[i] = split_heads[i].get();
+            ver.set_split_heads(shp, (int) split_heads.size());
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -12326,6 +12387,11 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
         if (pcie_balance()) ver.set_pcie_balance(&drive.d.pcie_model);
+        {   // head split (the one-shot generate path's verifier)
+            strata::core::SplitHead* shp[3] = {};
+            for (size_t i = 0; i < split_heads.size() && i < 3; ++i) shp[i] = split_heads[i].get();
+            ver.set_split_heads(shp, (int) split_heads.size());
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
