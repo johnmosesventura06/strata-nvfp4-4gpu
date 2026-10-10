@@ -178,6 +178,32 @@ graph-compatible, measured +3-5% there._
   hs-np1-{off,on}-pin5.json, results /tmp/hs_battery5_results.txt, probes /tmp/hs5_{off,on}.txt.
   Note for production: with the code fix, split boots never self-commit regardless of the env;
   the env is only the parity control.
+- BATTERY5 RESULT (05:01-05:10): **PARITY GATE PASSED** — residency matched (2656 slots +
+  5464×3 both arms), probes byte-identical (1510 B both). The merge is bitwise the full-head
+  greedy pick. Self-commit root cause confirmed fixed.
+- NP2 PRODUCTION BATTERY #1 (mapped protocol, 05:07-05:14, hs-np2-on @0.7515 equal thirds):
+  exact-string ×3 PASS, needle@40K verbatim PASS, pp 1819.8 = band (unchanged ✓), decode #1
+  69.6 (cold: 16 lazy part-graph captures) → #2 **82.6 t/s = winner band, NOT the +7-9% target**.
+  Util 0:100%, peers 8-20% (parts active). Verdict: correctness banked, speed neutral.
+- WHY NEUTRAL (code-grounded): the ~1.2ms/round saving was eaten by (a) submit timing — the
+  async batch_poll launches parts only on the first host poll AFTER the handoff rises (drafting
+  occupies the host meanwhile → parts start late → the merge waits serially), and (b) logits
+  assembly — sampling windows (every production request) copy ~2MB/part to mapped host, then
+  3 serial join_range PCIe reads on main before sample_rows. Commit path exonerated:
+  set_commit_async(!multi_gpu) = async already ON for this lane.
+- **P2.5 = d2c6d36 (built green 05:29)**: GPU-side protocol. Parts' graphs begin with the
+  engine's OWN wait_flag_ge doorbell kernel (proven capturable — every window graph uses it) on a
+  flag in the PART's VRAM; main's in-graph bump = one-word P2P write (p2p matrix 12/12 OK); the
+  part zeroes its flag in-graph after the wait (race-free: the host launches N+1 only after N's
+  merge). Host pre-launches parts at WINDOW start (run/run_slot_rows/batch_launch) — one graph
+  launch, zero polling dependency. Logits: parts join_range DIRECTLY into main's head_full_ over
+  P2P (parallel; replaces mapped copies + serial main-side joins); merge assembles only the
+  main's part. set_target from Verifier::init post-carve; ALL 16 (T,logits) graphs pre-captured
+  at boot (kills the cold-capture cost; boot +~1-2s). Fallback: any pre-capture failure → the
+  mapped protocol (parity-proven P2 path) + a stderr line.
+- PARITY RE-GATE (battery5b, launched 05:31): protocol changed → byte-identical greedy must
+  re-pass before any speed claim. Same pinned configs (reserve-mirror 933/768,
+  ONE_TOKEN_COMMIT=0 both arms, equal thirds 0.7515). Then np2 speed battery #2.
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
