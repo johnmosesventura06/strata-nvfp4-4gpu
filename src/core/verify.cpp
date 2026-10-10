@@ -2995,14 +2995,17 @@ bool Verifier::split_merge(int T, std::string& err) {
         const int64_t N = g_->n_embd;
         static int32_t* dbg_ids = nullptr;
         static float* dbg_full = nullptr;
+        static long dbg_checked = 0;   // positive control: the silence of the mismatch lines must be EARNED
         if (dbg_ids == nullptr && cudaMalloc((void**) &dbg_ids, (size_t) max_t_ * 4) != cudaSuccess) {
             (void) cudaGetLastError();
             dbg_ids = nullptr;
+            std::fprintf(stderr, "strata dbg: split verify OFF - the pick buffer allocation failed\n");
         }
         if (dbg_sv > 1 && dbg_full == nullptr &&
             cudaMalloc((void**) &dbg_full, (size_t) max_t_ * (size_t) n_vocab_ * 4) != cudaSuccess) {
             (void) cudaGetLastError();
             dbg_full = nullptr;
+            std::fprintf(stderr, "strata dbg: split verify level 2 OFF - the logits buffer allocation failed\n");
         }
         float* full = dbg_sv > 1 && dbg_full != nullptr ? dbg_full : head_full_;
         if (dbg_ids != nullptr) {
@@ -3017,7 +3020,7 @@ bool Verifier::split_merge(int T, std::string& err) {
                 argmax_rows(full, T, (int) n_vocab_, arg_scratch_, dbg_ids, cs_);
                 if (cudaStreamSynchronize(cs_) == cudaSuccess) {
                     std::vector<int32_t> ids((size_t) T);
-                    if (cudaMemcpy(ids.data(), dbg_ids, (size_t) T * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
+                    if (cudaMemcpy(ids.data(), dbg_ids, (size_t) T * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
                         for (int t = 0; t < T; ++t) {
                             const int32_t got = ((volatile int32_t*) h_out_)[t];
                             if (ids[(size_t) t] != got)
@@ -3026,6 +3029,12 @@ bool Verifier::split_merge(int T, std::string& err) {
                                              "the merge picked %d\n",
                                              (long long) windows, t, ids[(size_t) t], got);
                         }
+                        const long first = dbg_checked;
+                        dbg_checked += T;
+                        if (first == 0 || first / 1000 != dbg_checked / 1000)
+                            std::fprintf(stderr, "strata dbg: split verify: %ld rows checked, no mismatch\n",
+                                         dbg_checked);
+                    }
                     if (dbg_sv > 1 && dbg_full != nullptr && full == dbg_full && split_logits_wanted()) {
                         std::vector<float> a((size_t) T * (size_t) n_vocab_), b(a.size());
                         if (cudaMemcpy(a.data(), head_full_, a.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
