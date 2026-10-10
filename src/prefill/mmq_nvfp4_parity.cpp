@@ -43,6 +43,9 @@ void ck(cudaError_t e, const char* what) {
 }
 
 // one product: x [T, cols] times w [rows, cols]^T
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(__clang__)
+__attribute__((target("f16c")))   // host gcc 15 refuses the F16C intrinsics at baseline -march (tool-only fix)
+#endif
 float half_round(float v) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtps_ph(_mm_set_ss(v), 0))); }
 
 int product(const uint8_t* w_host, int64_t rows, int64_t cols, int T, const char* what, std::mt19937& rng,
