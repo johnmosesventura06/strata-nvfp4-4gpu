@@ -50,7 +50,9 @@
   "--peer-prefill-rows",
   "0",
   "--conversation-cache-mib",
-  "25600"
+  "25600",
+  "--conversation-cache-dir",
+  "journal"
  ],
  "sampling": {
   "temperature": 1.0,
