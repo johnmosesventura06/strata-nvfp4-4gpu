@@ -201,9 +201,30 @@ graph-compatible, measured +3-5% there._
   main's part. set_target from Verifier::init post-carve; ALL 16 (T,logits) graphs pre-captured
   at boot (kills the cold-capture cost; boot +~1-2s). Fallback: any pre-capture failure → the
   mapped protocol (parity-proven P2 path) + a stderr line.
-- PARITY RE-GATE (battery5b, launched 05:31): protocol changed → byte-identical greedy must
-  re-pass before any speed claim. Same pinned configs (reserve-mirror 933/768,
-  ONE_TOKEN_COMMIT=0 both arms, equal thirds 0.7515). Then np2 speed battery #2.
+- PARITY RE-GATE (battery5b, 05:30-05:40): **FAIL at char 166** — but on paths the greedy probe
+  doesn't exercise (greedy → no logits → no P2P joins; picks flow through the SAME mapped buffers
+  battery5 proved identical). P2.5 changes are timing-only; timing can't alter arithmetic without
+  a race, and every ordering re-traced sound (reset-vs-bump host-ordered, fences in place, one
+  writer per flag).
+- **OFF-VS-OFF CROSS-BOOT TEST (05:38-05:47) = THE VERDICT: the engine is NOT boot-deterministic.**
+  Same OFF config twice: 1510 B vs 1348 B probes, divergence at char 19 with the IDENTICAL pattern
+  the "failed" gates showed ("We need answer user:" vs "user's request:"). The same P2.5 binary
+  produced both 1510 and 1527 across boots. No split code involved. → byte-identical cross-boot
+  comparison is INVALID METHODOLOGY on this engine: battery5's PASS was luck, battery4/5b FAILs
+  were noise. Within-boot determinism still holds (earlier ×3 probes identical inside one boot);
+  something across boots (journal/adaptive-tier initial state — uninvestigated, baseline engine
+  behavior, affects the winner binary equally) shifts one near-tie token and the reasoning
+  regenerates differently.
+- **ACCEPTANCE GATE (replaces byte-compare) = STRATA_DBG_SPLIT_VERIFY in-boot harness (5680b03)**:
+  after EVERY merge, the full head is recomputed on main with the same kernels the unsplit path
+  runs and compared — level 1: merged picks vs full argmax; level 2: assembled/P2P logits rows vs
+  recompute, bitwise memcmp. In-boot, per-window, immune to cross-boot noise. This mirrors the
+  engine's own hc-split precedent ("checked bit for bit against the plain read on this card").
+  DBG battery running 05:48+: np1 (greedy + temp-0.8 sampling probes) then np2 (decode-2000 +
+  temp-0.9 sampling) with level 2; acceptance = ZERO "SPLIT MISMATCH"/"SPLIT LOGITS MISMATCH"
+  lines and ZERO "fell back to mapped" (gpu protocol active). Results /tmp/hs_dbg_results.txt.
+- THEN: production speed battery (no dbg env, P2.5 binary) → decode vs 82.6 (mapped protocol) and
+  winner band 77-87, target ≥ 90; adoption = owner gate.
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
