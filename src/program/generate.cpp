@@ -1935,6 +1935,8 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = std::atoll(next("--conversation-cache-disk-mib"));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib") {
             const std::string value = next(a.c_str());
@@ -1947,8 +1949,7 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
-        else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
-        else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = std::atoll(next("--conversation-cache-disk-mib"));
+
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
@@ -7486,6 +7487,8 @@ int main(int argc, char** argv) {
         auto journal_load = [&] {
             std::error_code ec;
             std::filesystem::create_directories(o.conversation_cache_dir, ec);
+            std::filesystem::permissions(o.conversation_cache_dir, std::filesystem::perms::owner_all,
+                                         std::filesystem::perm_options::replace, ec);   // conversations live in here
             if (ec || !std::filesystem::is_directory(o.conversation_cache_dir, ec)) {
                 std::fprintf(stderr, "strata serve: conversation journal: %s is not a usable directory; starting empty\n",
                              o.conversation_cache_dir.c_str());
