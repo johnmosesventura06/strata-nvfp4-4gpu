@@ -247,6 +247,15 @@ graph-compatible, measured +3-5% there._
   needs ≥3 reads a side); draft-accept vs the 68% band (engine log stats); owner feel-test +
   adoption gate. Lane currently: winner config on the split binary (control boot), winner binary
   banked at ~/strata-nvfp4/rollback-p3b-winner-20261011/ (md5 20a821e5...).
+- EXACT-STRING RESOLVED (06:14-06:25): winner control fresh boot + zebra×6 cold = 6/6 IDENTICAL.
+  Split repro (fresh boot, the battery's EXACT sequence warmup→zebra×6) = **6/6 IDENTICAL**
+  (content = the exact pattern every run, reasoning identical 147 chars), 0 dbg mismatches,
+  draft-accept 53/75 = 70.7% (band ✓). The battery's one-off ×3 False DID NOT REPRODUCE; it was
+  reasoning-only drift of the same class as the proven engine boot-nondeterminism (content never
+  wavered). Item logged honestly as a one-off; the repro passes.
+- FINAL A/B (launched 06:27, /tmp/hs_ab_final.txt): interleaved fresh boots, SAME binary,
+  W=p3b-on vs S=hs-np2-on, 3 rounds, decode-2000 (same essay prompt) + per-boot draft-accept
+  tally. Verdict rule: split median vs winner median; adoption needs a clear margin (owner gate).
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
