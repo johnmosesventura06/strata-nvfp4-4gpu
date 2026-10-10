@@ -225,6 +225,28 @@ graph-compatible, measured +3-5% there._
   lines and ZERO "fell back to mapped" (gpu protocol active). Results /tmp/hs_dbg_results.txt.
 - THEN: production speed battery (no dbg env, P2.5 binary) → decode vs 82.6 (mapped protocol) and
   winner band 77-87, target ≥ 90; adoption = owner gate.
+- WITNESS RUN (06:00-06:04): positive control PASSED — heartbeat "1000 rows checked, no mismatch",
+  0 mismatches, 0 fallbacks (GPU protocol active), 0 alloc failures (level 2 live). Combined with
+  np2dbg (2500 tokens, env verified in /proc/PID/environ): **the split is bitwise exact in-boot on
+  np1 AND np2, picks AND logits. CORRECTNESS GATE MET.**
+- PRODUCTION SPEED BATTERY #2 (P2.5, no dbg, 06:03-06:10): decode-2000 #1 = **97.9 t/s** (above
+  the 93-95 target; +13-14% over band middle), #2 = 86.5 (top of winner band; ran while util
+  sampled — one sample shows all-4-GPU 93%+ = suspected adaptive-tier swap burst after #1's 2000
+  tokens). pp 1829.7 = band ✓ unchanged. needle@40K verbatim ✓. exact-string ×3: **False** ⚠.
+- EXACT-STRING ISOLATION (in flight): 6× the same probe on the warm split boot = 6/6 IDENTICAL
+  (content = the exact pattern every time; only reasoning tokens drift when they do). The battery's
+  ×3 ran as the FIRST requests after boot (post one warmup) → hypothesis: cold-start state
+  evolution (adaptive swaps after the first requests) flips near-tie reasoning tokens between
+  consecutive requests — the same near-tie class as the proven cross-boot nondeterminism, and
+  content stayed exact. Control running: winner config (p3b-on, split code dead) fresh boot +
+  zebra×6 cold → if the winner ALSO drifts across its first requests = baseline engine behavior,
+  split innocent on this item; if the winner is stable = dig into the split's cold path.
+  Results: /tmp/hs_winner_control.txt.
+- OPEN before adoption: exact-string control verdict; more decode samples for a solid A/B
+  (interleaved fresh boots split-on vs winner per the bench-validity law; 97.9 vs 86.5 spread
+  needs ≥3 reads a side); draft-accept vs the 68% band (engine log stats); owner feel-test +
+  adoption gate. Lane currently: winner config on the split binary (control boot), winner binary
+  banked at ~/strata-nvfp4/rollback-p3b-winner-20261011/ (md5 20a821e5...).
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse
