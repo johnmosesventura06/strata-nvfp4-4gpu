@@ -33,7 +33,7 @@
   "--kv",
   "int8",
   "--prefill",
-  "auto",
+  "6144",
   "--serve",
   "--mtp-q4",
   "head",
@@ -64,7 +64,9 @@
  },
  "tokenizer": "../models/orca-nvfp4/pack/tokenizer",
  "env": {
-  "CUDA_DEVICE_ORDER": "PCI_BUS_ID"
+  "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+  "STRATA_PREFILL_CPU_SHARE": "auto",
+  "STRATA_PREFILL_CPU_SHARE_MAX": "6145"
  },
  "host": "100.71.205.101",
  "port": 8190,
