@@ -67,6 +67,9 @@ python3 serve/server.py --engine build/strata --config configs/nvfp4-512k-np2-vi
 
 The shipping config carries the whole stack: peer tiers, the journal, tier prefill, the CPU share
 (`STRATA_PREFILL_CPU_SHARE=auto` in its env) and the head split (`--native-head-gguf` + `--head-split 0.7515`).
+Every environment variable the lane sets — and the knobs worth knowing when your numbers do not
+match ours (P2P A/B, CPU-share ceiling, the head-split bitwise harness) — is explained in
+[.env.example](.env.example).
 It binds to 127.0.0.1 by default. The server has no API key, so keep it on localhost or behind a VPN before
 you change the host, or start it with `--api-key`.
 
