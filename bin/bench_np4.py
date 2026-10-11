@@ -34,7 +34,7 @@ def one(host, port, i, tokens):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8190)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="100.71.205.101")
     ap.add_argument("--n", type=int, default=4)
     ap.add_argument("--tokens", type=int, default=1200)
     a = ap.parse_args()

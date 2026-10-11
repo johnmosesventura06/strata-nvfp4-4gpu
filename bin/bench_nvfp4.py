@@ -43,7 +43,7 @@ def gen(host, port, prompt, max_tokens, temperature=0.0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="100.71.205.101")
     ap.add_argument("--src", default="/home/ai-host/strata-nvfp4/strata/src/prefill/prefill.cpp")
     ap.add_argument("--what", default="all", choices=("trio", "gates", "all"))
     a = ap.parse_args()

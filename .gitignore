@@ -61,5 +61,3 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
-journal/
-sessions/

@@ -10,7 +10,7 @@ import urllib.request
 import zlib
 import sys
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+HOST = sys.argv[1] if len(sys.argv) > 1 else "100.71.205.101"
 
 
 def png(w, h, pixels):

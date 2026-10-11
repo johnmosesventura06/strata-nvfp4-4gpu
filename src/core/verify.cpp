@@ -459,6 +459,29 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
+    // head split: the main keeps rows [0, split) of the head compute (its weights stay whole - native_mmvq's
+    // n_out bounds the read), and the parts must tile [split, n_vocab) in order, gapless, to the vocab end.
+    // AFTER n_vocab_ is known (the first placement of this block preceded the assignment above and validated
+    // against n_vocab_ == 0 - caught by the np1 parity boot: "tile [61952, 0)").
+    if (n_shead_ > 0) {
+        if (head_ == nullptr || !head_->loaded()) {
+            err = "verify: the head split needs the native head (--native-head-gguf)";
+            return false;
+        }
+        head_rows_ = sheads_[0]->split();
+        int64_t pos = head_rows_;
+        for (int i = 0; i < n_shead_; ++i) {
+            if (sheads_[i] == nullptr || sheads_[i]->split() != pos || sheads_[i]->end() > n_vocab_) {
+                err = "verify: the head parts must tile [" + std::to_string(head_rows_) + ", " +
+                      std::to_string(n_vocab_) + ") without gaps";
+                return false;
+            }
+            pos = sheads_[i]->end();
+        }
+        if (pos != n_vocab_) { err = "verify: the head parts do not reach the vocabulary's end"; return false; }
+    } else {
+        head_rows_ = n_vocab_;
+    }
 
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
@@ -491,6 +514,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (n_shead_ > 0 && !mapped(T * 4 + 16, (void**) &h_val_, (void**) &m_val_)) {   // head split: the main part's winning logits
+        err = "verify: mapped split-head logits allocation failed";
+        return false;
+    }
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
             err = "verify: mapped balance stamps allocation failed";
@@ -563,6 +590,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        if (n_shead_ > 0) head_full_ = b.take<float>(T * (uint64_t) n_vocab_);   // head split: the assembled rows
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
@@ -601,6 +629,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    if (n_shead_ > 0)   // head split: the parts write their P2P logits rows straight into the assembled buffer
+        for (int i = 0; i < n_shead_; ++i) sheads_[i]->set_target(head_full_, n_vocab_);
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -724,7 +754,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
-    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // head split: with parts, the in-graph pick is the MAIN's ranged argmax only - the merged pick exists only
+    // host-side after the window, so a T==1 window must take the host commit path (Verifier::commit below matches).
+    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && n_shead_ == 0 && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
@@ -1634,14 +1666,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         if (head_ != nullptr && head_->loaded()) {
+            // head split: hand the window's mixed rows to every part and raise its handoff — both graph-capturable
+            // (a mapped copy + the bump kernel); the parts run on their GPUs while the main computes its range here.
+            // GPU protocol: the bump is a one-word P2P write into the part's own device flag, which its
+            // pre-launched graph wait-values on (threadfence_system in the bump orders it after the input rows).
+            if (n_shead_ > 0) {
+                for (int si = 0; si < n_shead_; ++si) {
+                    strata::kernels::copy_from_mapped(sheads_[si]->input(), head_mixed_, (int64_t) T * N, cs);
+                    strata::kernels::mapped_bump(sheads_[si]->gpu_protocol() ? sheads_[si]->hand_dev()
+                                                                             : sheads_[si]->handoff(),
+                                                 cs);
+                }
+            }
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
+                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) head_rows_)) {
                     strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
-                                                    (int) n_vocab_, (int) T, cs);
+                                                    (int) head_rows_, (int) T, cs);
                 } else
-                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) head_rows_, T, cs);
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
@@ -1650,8 +1694,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        if (argmax_rows_wanted()) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the one-block kernel's)
-            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+        if (argmax_rows_wanted() || n_shead_ > 0) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the
+            // one-block kernel's).  Head split: always this path — the host merge needs each row's winning logit
+            // (out_val), and the pick is bitwise sample_tokens' greedy one (argmax_rows' contract).
+            argmax_rows(head_logits_, T, (int) head_rows_, arg_scratch_, m_out_, cs, n_shead_ > 0 ? m_val_ : nullptr);
         } else {
             SamplerParams sp;
             sp.greedy = true;
@@ -1975,6 +2021,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+    split_submitted_ = false;   // head split: this window's parts have not been submitted yet
+    // gpu protocol: pre-launch the parts now - their graphs wait-value on the main's in-graph bump, so they
+    // start without any host poll in between.  Mapped protocol: this is a no-op until the handoff rises.
+    if (n_shead_ > 0 && le_ == g.n_layers && !split_submit(T, err, false)) return false;
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -2092,6 +2142,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
     // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
     // beside the expert workers).
+    // head split: the parts start as soon as the window's handoffs rise — while the main still computes its
+    // own ranged head — so their part overlaps the tail instead of following the sync.
+    if (n_shead_ > 0 && le_ == g.n_layers && !split_submit(T, err, true)) return false;
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
@@ -2109,6 +2162,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
+    if (!split_merge(T, err)) return false;      // head split: merge the parts' picks before any consumer reads them
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
@@ -2118,6 +2172,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    const float* lg = n_shead_ > 0 ? head_full_ : head_logits_;   // head split: the assembled full-vocab rows
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
@@ -2137,14 +2192,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                         cudaSuccess &&
                     cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
                                     cudaMemcpyHostToDevice, cs_) == cudaSuccess)
-                    judged = sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, d_spec_, d_q, nq,
+                    judged = sample_tokens_spec(lg, T, (int) n_vocab_, hist_d_, hist_len_, sp, d_spec_, d_q, nq,
                                                 m_out_, cs_);
             }
         }
         spec_q_ = nullptr;
         spec_nq_ = 0;
         if (judged) ++spec_windows;
-        else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        else sample_tokens(lg, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
@@ -2266,13 +2321,20 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
                                std::string& err) {
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
     const OnDevice on_device(device_);
-    if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
+    // head split: head_full_ exists only for windows whose consumers sampled (split_merge assembles it then);
+    // a greedy window's logprobs would read an unassembled buffer - refuse rather than report garbage.
+    if (n_shead_ > 0 && !split_logits_wanted()) {
+        err = "window_logprobs: the head split assembles the full logits only for sampling windows";
+        return false;
+    }
+    const float* lg = n_shead_ > 0 ? head_full_ : head_logits_;
+    if (lg == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
         err = "window_logprobs: no head logits for this window";
         return false;
     }
     // run() synchronized cs_ before returning, so the head of this window is complete
     std::vector<float> h((size_t) T * (size_t) n_vocab_);
-    if (cudaMemcpy(h.data(), head_logits_, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    if (cudaMemcpy(h.data(), lg, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
         err = "window_logprobs: the head logits copy failed";
         return false;
     }
@@ -2328,8 +2390,9 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && one_token_self_commit()) {
+    if (last_t_ == 1 && n_shead_ == 0 && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
+        // (head split: never - its in-graph pick is unmerged, so the commit graph runs with the merged tokens)
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
@@ -2691,9 +2754,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const ModelGeometry& g = *g_;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    split_submitted_ = false;   // head split: this window's parts have not been submitted yet
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
+    if (n_shead_ > 0 && le_ == g.n_layers && !split_submit(S, err, false)) return false;   // gpu protocol: pre-launch
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
@@ -2711,12 +2776,14 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             _mm_sfence();
             *flag = 1;
         }
+        if (n_shead_ > 0 && le_ == g.n_layers && !split_submit(S, err, true)) return false;   // head split: parts overlap the tail
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
         cudaStreamSynchronize(copy_);
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        if (!split_merge(S, err)) return false;
         if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         progress_at("decode");
@@ -2770,12 +2837,14 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (n_shead_ > 0 && le_ == g.n_layers && !split_submit(S, err, true)) return false;   // head split: parts overlap the tail
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    if (!split_merge(S, err)) return false;
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     progress_at("decode");
@@ -2836,11 +2905,157 @@ bool Verifier::sample_rows(int S, std::string& err) {
         if (sp.greedy || sp.temperature <= 0.0f) continue;
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
         sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
-                                       m_out_ + t, cs_);
+        strata::kernels::sample_tokens((n_shead_ > 0 ? head_full_ : head_logits_) + (size_t) t * (size_t) n_vocab_, 1,
+                                       (int) n_vocab_, nullptr, 0, sp, m_out_ + t, cs_);
         any = true;
     }
     if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+    return true;
+}
+
+// ---- the head split's host half (the in-graph half is record_window's: the mapped handoff writes + bumps, the
+// ranged main compute, the argmax with its winning logits).  One window in flight per SplitHead set: submit
+// once a window's handoffs have risen, merge once its stream is done - both before any consumer of the picks.
+
+bool Verifier::split_logits_wanted() const {
+    if (n_shead_ <= 0 || !head_sampling_) return false;
+    if (last_batch_) {   // a batch window: sample_rows' per-row samplers read the full-vocab rows
+        for (int t = 0; t < last_t_; ++t) {
+            const strata::kernels::SamplerParams& sp = slot_sp_[(size_t) last_rows_[t]];
+            if (!sp.greedy && sp.temperature > 0.0f) return true;
+        }
+        return false;
+    }
+    return (!sampling_.greedy && sampling_.temperature > 0.0f) || hist_d_ != nullptr;
+}
+
+bool Verifier::split_submit(int T, std::string& err, bool block) {
+    if (n_shead_ <= 0 || split_submitted_) return true;
+    const bool gpu = sheads_[0]->gpu_protocol();
+    const bool logits = split_logits_wanted();
+    if (!gpu) {   // mapped protocol: the input rows must be down before the launch - block spins the handoff,
+        for (int i = 0; i < n_shead_; ++i) {   // the non-blocking variant returns until it has risen
+            if (!block) {
+                if (*(volatile uint32_t*) sheads_[i]->handoff() < hand_n_ + 1) return true;
+            } else {
+                const auto t0 = std::chrono::steady_clock::now();
+                while (*(volatile uint32_t*) sheads_[i]->handoff() < hand_n_ + 1) {
+                    _mm_pause();
+                    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
+                        err = "verify: a head part never saw the window's handoff";
+                        return false;
+                    }
+                }
+            }
+        }
+        ++hand_n_;
+    }
+    // gpu protocol: the graph wait-values on its own device flag - launching at the window's start costs one
+    // cudaGraphLaunch and the part begins the instant the main's in-graph bump lands.
+    for (int i = 0; i < n_shead_; ++i)
+        if (!sheads_[i]->submit(T, logits, err)) { if (!gpu) --hand_n_; return false; }
+    split_submitted_ = true;
+    return true;
+}
+
+bool Verifier::split_merge(int T, std::string& err) {
+    if (n_shead_ <= 0) return true;
+    if (!split_submit(T, err, true)) return false;   // a window finished without the poll having submitted
+    ++done_n_;
+    for (int i = 0; i < n_shead_; ++i)
+        if (!sheads_[i]->wait(done_n_, err)) return false;
+    // the merge: the largest logit wins, ties the lower global index - bitwise the full head's greedy pick
+    // (the parts tile the vocab in order; the main's indices are the lowest).
+    for (int t = 0; t < T; ++t) {
+        float best = ((volatile float*) h_val_)[t];
+        int32_t pick = ((volatile int32_t*) h_out_)[t];
+        for (int i = 0; i < n_shead_; ++i) {
+            const float v2 = ((volatile const float*) sheads_[i]->val())[t];
+            const int32_t g2 = (int32_t) (sheads_[i]->split() + sheads_[i]->idx()[t]);
+            if (v2 > best || (v2 == best && g2 < pick)) { best = v2; pick = g2; }
+        }
+        ((volatile int32_t*) h_out_)[t] = pick;
+        ((volatile float*) h_val_)[t] = best;
+    }
+    if (split_logits_wanted()) {   // the main's rows into the assembled buffer; with the gpu protocol the
+        strata::kernels::join_range(head_full_, n_vocab_, head_logits_, 0, head_rows_, head_rows_, T, cs_);
+        if (!sheads_[0]->gpu_protocol())   // parts' rows are already there (P2P writes before their done bumps)
+            for (int i = 0; i < n_shead_; ++i)
+                strata::kernels::join_range(head_full_, n_vocab_, sheads_[i]->logits(), sheads_[i]->split(),
+                                            sheads_[i]->end(), sheads_[i]->part_rows(), T, cs_);
+    }
+    // STRATA_DBG_SPLIT_VERIFY (test-only): the in-boot proof, immune to cross-boot noise - recompute the FULL
+    // head on the main with the same kernels the unsplit path runs (xq_/xil_ still hold this window's
+    // quantized rows; the window stream is synced) and compare.  Level 1: every merged pick against the full
+    // head's argmax.  Level 2: also memcmp the assembled/P2P-written full-vocab rows against the recomputed
+    // ones, bitwise.  Silence across a run = the split is exact; any mismatch names the window, row and picks.
+    static const int dbg_sv = std::getenv("STRATA_DBG_SPLIT_VERIFY") ? std::atoi(std::getenv("STRATA_DBG_SPLIT_VERIFY")) : 0;
+    if (dbg_sv > 0 && head_ != nullptr && head_->loaded()) {
+        using namespace strata::kernels;
+        const int64_t N = g_->n_embd;
+        static int32_t* dbg_ids = nullptr;
+        static float* dbg_full = nullptr;
+        static long dbg_checked = 0;   // positive control: the silence of the mismatch lines must be EARNED
+        if (dbg_ids == nullptr && cudaMalloc((void**) &dbg_ids, (size_t) max_t_ * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            dbg_ids = nullptr;
+            std::fprintf(stderr, "strata dbg: split verify OFF - the pick buffer allocation failed\n");
+        }
+        if (dbg_sv > 1 && dbg_full == nullptr &&
+            cudaMalloc((void**) &dbg_full, (size_t) max_t_ * (size_t) n_vocab_ * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            dbg_full = nullptr;
+            std::fprintf(stderr, "strata dbg: split verify level 2 OFF - the logits buffer allocation failed\n");
+        }
+        float* full = dbg_sv > 1 && dbg_full != nullptr ? dbg_full : head_full_;
+        if (dbg_ids != nullptr) {
+            try {
+                if (g_mmvq_il() && native_mmvq_il_supported(head_->type(), T, (int) n_vocab_)) {
+                    // xil_ may be stale when the window's ranged path took the plain branch (il support can
+                    // differ between head_rows_ and n_vocab_): re-interleave from xq_, which both paths wrote.
+                    strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, T, cs_);
+                    native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, full, (int) N, (int) n_vocab_, T, cs_);
+                } else
+                    native_mmvq(head_->type(), head_->weights(), xq_, full, (int) N, (int) n_vocab_, T, cs_);
+                argmax_rows(full, T, (int) n_vocab_, arg_scratch_, dbg_ids, cs_);
+                if (cudaStreamSynchronize(cs_) == cudaSuccess) {
+                    std::vector<int32_t> ids((size_t) T);
+                    if (cudaMemcpy(ids.data(), dbg_ids, (size_t) T * 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                        for (int t = 0; t < T; ++t) {
+                            const int32_t got = ((volatile int32_t*) h_out_)[t];
+                            if (ids[(size_t) t] != got)
+                                std::fprintf(stderr,
+                                             "strata dbg: SPLIT MISMATCH window %lld row %d: the full head picks %d, "
+                                             "the merge picked %d\n",
+                                             (long long) windows, t, ids[(size_t) t], got);
+                        }
+                        const long first = dbg_checked;
+                        dbg_checked += T;
+                        if (first == 0 || first / 1000 != dbg_checked / 1000)
+                            std::fprintf(stderr, "strata dbg: split verify: %ld rows checked, no mismatch\n",
+                                         dbg_checked);
+                    }
+                    if (dbg_sv > 1 && dbg_full != nullptr && full == dbg_full && split_logits_wanted()) {
+                        std::vector<float> a((size_t) T * (size_t) n_vocab_), b(a.size());
+                        if (cudaMemcpy(a.data(), head_full_, a.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                            cudaMemcpy(b.data(), dbg_full, b.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
+                            for (size_t i = 0; i < a.size(); ++i)
+                                if (std::memcmp(&a[i], &b[i], 4) != 0) {
+                                    std::fprintf(stderr,
+                                                 "strata dbg: SPLIT LOGITS MISMATCH window %lld row %zu col %zu: "
+                                                 "assembled %g, recomputed %g\n",
+                                                 (long long) windows, i / (size_t) n_vocab_, i % (size_t) n_vocab_,
+                                                 (double) a[i], (double) b[i]);
+                                    break;
+                                }
+                    }
+                }
+            } catch (const std::exception& x) {
+                std::fprintf(stderr, "strata dbg: the split verify recompute failed: %s\n", x.what());
+            }
+        }
+    }
+    split_submitted_ = false;
     return true;
 }
 
@@ -2851,10 +3066,12 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+    split_submitted_ = false;   // head split: this window's parts have not been submitted yet
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
+    if (n_shead_ > 0 && le_ == g_->n_layers && !split_submit(S, err, false)) return false;   // gpu protocol: pre-launch
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) rows[t]];
@@ -2924,6 +3141,9 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         b_last_ = Clock::now();
         ++b_k_;
     }
+    // head split: submit the parts the poll the window's handoffs have risen on — they compute while the main
+    // GPU finishes the window's head and commit graphs (non-blocking: not risen yet, try again next poll).
+    if (n_shead_ > 0 && le_ == g_->n_layers && !split_submit(S, err, false)) { b_running_ = false; return -1; }
     const cudaError_t q = cudaStreamQuery(cs_);
     if (q == cudaErrorNotReady) return 0;
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
@@ -2931,6 +3151,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (qc == cudaErrorNotReady) return 0;
     if (prof_on_) collect_profile();
     if (last_stage()) {
+        if (!split_merge(S, err)) { b_running_ = false; return -1; }
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
         for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
     }
@@ -2942,8 +3163,10 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
 
 bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
-    if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
-    return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
+    if (n_shead_ > 0 && !split_logits_wanted()) return false;   // the full rows were not assembled this window
+    const float* lg = n_shead_ > 0 ? head_full_ : head_logits_;
+    if (lg == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+    return cudaMemcpy(host, lg + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
@@ -3179,11 +3402,14 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
     const int T = fl_T_;
+    // head split: the pipelined path has no mid-window poll, so submit+merge land here (the window is done;
+    // the handoff spin and the parts' wait are immediate).  split_merge submits when it must.
+    if (!split_merge(T, err)) return false;
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        sample_tokens(n_shead_ > 0 ? head_full_ : head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = "verify: the head sampling failed";
             return false;

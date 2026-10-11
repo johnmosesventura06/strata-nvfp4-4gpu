@@ -752,7 +752,7 @@ struct ArgRow {
 
 // grid (blocks, rows): block b scans [b * per_block, +per_block) of its row
 __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int per_block, ArgRow* __restrict__ rows,
-                                   int32_t* out) {
+                                   int32_t* out, float* out_val) {
     const int row = (int) blockIdx.y, b = (int) blockIdx.x, nb = (int) gridDim.x;
     unsigned* counter = &rows[row].counter;
     float* pv = rows[row].v;
@@ -785,8 +785,21 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     arg_block(bv, bi, n);
     if (threadIdx.x == 0) {
         out[row] = bi < n ? bi : 0;   // no value above -inf: 0, as the one-block kernel
+        if (out_val != nullptr) out_val[row] = bv;   // head-split: the winning logit, for the host's cross-part merge
         *counter = 0;
     }
+}
+
+__global__ void mapped_bump_kernel(uint32_t* flag) {
+    __threadfence_system();
+    *(volatile uint32_t*) flag = *(volatile uint32_t*) flag + 1u;
+}
+
+__global__ void join_range_kernel(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc) {
+    const int64_t t = blockIdx.y;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < hi - lo;
+         i += (int64_t) gridDim.x * blockDim.x)
+        dst[t * n + lo + i] = ((const volatile float*) src)[t * nsrc + i];
 }
 
 // a row's top-probability scratch: its counter, then its 32 warps' sums
@@ -825,13 +838,25 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
 
 uint64_t argmax_rows_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(ArgRow); }
 
-void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream) {
+void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream, float* out_val) {
     if (n_rows <= 0) return;
     const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
     const int per_block = (n + nb - 1) / nb;
     argmax_rows_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kArgThreads, 0, (cudaStream_t) stream>>>(
-        logits, n, per_block, (ArgRow*) scratch, out);
+        logits, n, per_block, (ArgRow*) scratch, out, out_val);
     check("argmax_rows");
+}
+
+void mapped_bump(uint32_t* flag, void* stream) {
+    mapped_bump_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag);
+    check("mapped_bump");
+}
+
+void join_range(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc, int rows,
+                void* stream) {
+    if (hi <= lo) return;
+    join_range_kernel<<<dim3(128, (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(dst, n, src, lo, hi, nsrc);
+    check("join_range");
 }
 
 uint64_t row_top_prob_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(TopRow); }
@@ -845,8 +870,16 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 }
 #else
 uint64_t argmax_rows_scratch_bytes(int) { return 0; }
-void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
+void argmax_rows(const float*, int, int, void*, int32_t*, void*, float*) {
     std::fprintf(stderr, "argmax_rows: not built for this backend\n");
+    std::exit(1);
+}
+void mapped_bump(uint32_t*, void*) {
+    std::fprintf(stderr, "mapped_bump: not built for this backend\n");
+    std::exit(1);
+}
+void join_range(float*, int64_t, const float*, int64_t, int64_t, int64_t, int, void*) {
+    std::fprintf(stderr, "join_range: not built for this backend\n");
     std::exit(1);
 }
 uint64_t row_top_prob_scratch_bytes(int) { return 0; }

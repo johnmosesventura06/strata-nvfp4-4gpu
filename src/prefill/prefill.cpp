@@ -820,6 +820,8 @@ struct Prefill::Impl {
     // pool's per-token activations and jobs.
     float *cpu_x = nullptr, *cpu_rows = nullptr, *cpu_ones = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0;
+    size_t cpu_ones_n = 0;   // floats in cpu_ones; tracked apart from cpu_rows_n - the peer tiers' row_sd fill
+                             // shares this buffer and can need more rows than the CPU experts ever did (P3b-fix)
     std::vector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
     std::vector<kernels::cpu::ExpertJobMulti> cpu_jobs;
@@ -892,6 +894,26 @@ struct Prefill::Impl {
                                              // every m.pp site; the held-expert loop runs over pp_at()/n_pp().
     PeerPrefill* pp_at(int i) const { return i == 0 ? pp.get() : pps[(size_t) (i - 1)].get(); }
     int n_pp() const { return (pp ? 1 : 0) + (int) pps.size(); }
+    // P3b-fix: the pinned buffer of 1.0 floats that row_sd fills read from. TWO owners: the CPU experts' rows
+    // (they carry s_down already) and every peer tier's returned rows (tiers run with sums off, so the combine
+    // must read 1 for their rows too). It used to be allocated only inside the CPU-share block: with the share
+    // gated off (batch slots, before the F10-share patch) it stayed NULL and the tier memcpy dereferenced it -
+    // the deterministic "prefill moe_combine: invalid argument" crash stashed in ba014c0. Sized independently
+    // now: a tier's back_rows can exceed the CPU block's rows_cpu*2, and overreading a pinned buffer is silent
+    // garbage row scales, not a fault.
+    bool ensure_cpu_ones(size_t need, std::string& err) {
+        if (need == 0 || (cpu_ones != nullptr && cpu_ones_n >= need)) return true;
+        if (cpu_ones) cudaFreeHost(cpu_ones);
+        cpu_ones = nullptr;
+        cpu_ones_n = 0;
+        if (cudaHostAlloc((void**) &cpu_ones, need * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            err = "prefill: cannot allocate the row-scale ones buffer";
+            return false;
+        }
+        std::fill(cpu_ones, cpu_ones + need, 1.0f);
+        cpu_ones_n = need;
+        return true;
+    }
     // layer split: the next stage's GPU as a stream-only peer (set_stage_helper); its buffers are that stage's own
     // prompt buffers, bound per prompt, and it takes the place of `pp` for a run it helps
     std::unique_ptr<PeerPrefill> help_pp;
@@ -3441,19 +3463,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t want = (size_t) rows_cpu * N;
                             if (m.cpu_rows_n < want) {
                                 cpu_cold = true;
-                                for (float* q : {m.cpu_rows, m.cpu_ones})
-                                    if (q) cudaFreeHost(q);
-                                m.cpu_rows = m.cpu_ones = nullptr;
+                                if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
+                                m.cpu_rows = nullptr;
                                 m.cpu_rows_n = 0;
                                 const size_t cap_rows = (size_t) rows_cpu * 2;   // headroom: few reallocations
-                                if (cudaHostAlloc((void**) &m.cpu_rows, cap_rows * N * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
-                                    cudaHostAlloc((void**) &m.cpu_ones, cap_rows * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                if (cudaHostAlloc((void**) &m.cpu_rows, cap_rows * N * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
                                     err = "prefill: cannot allocate the CPU experts' rows";
                                     return false;
                                 }
-                                std::fill(m.cpu_ones, m.cpu_ones + cap_rows, 1.0f);
                                 m.cpu_rows_n = cap_rows * N;
                             }
+                            // P3b-fix: cpu_ones has its own size track (the tiers' fills share it); ensure covers both
+                            if (!m.ensure_cpu_ones((size_t) rows_cpu * 2, err)) return false;
                             const int64_t r0c = T * K - rows_cpu;
                             const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
                             if (cpu_share_env() < 0.0) {
@@ -4149,11 +4170,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (!Q.p2p && !Q.sums)
                                 copy_f32_wide(m.Dm + (size_t) Q.back_at * N, Q.host_rows, Q.back_rows * N, m.cs);
                             if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off &&
-                                !Q.sums && Q.back_rows > 0)
+                                !Q.sums && Q.back_rows > 0) {
                                 // P3a: the tier applied s_down to its rows itself (scale_down_rows); the combine must
                                 // read 1 there - this region's value is whatever the last layer that reached it wrote.
+                                // P3b-fix: this path is the FIRST to need cpu_ones whenever the CPU share is off
+                                // (it never runs when sums is on) - allocate and size it here, not in the share block.
+                                if (!m.ensure_cpu_ones((size_t) Q.back_rows, err)) return false;
                                 cudaMemcpyAsync(m.row_sd + (size_t) Q.back_at, m.cpu_ones,
                                                 (size_t) Q.back_rows * sizeof(float), cudaMemcpyHostToDevice, m.cs);
+                            }
                         }
                     }
                     const float* row_sd_l = use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr;

@@ -26,6 +26,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/split_head.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -122,6 +123,18 @@ public:
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+
+    /// HEAD SPLIT (peer GPUs): the parts tile [the main head's rows, n_vocab) in order - part i computes its
+    /// rows on its own GPU per window (SplitHead's mapped handoff protocol), and the host merges the picks
+    /// (largest logit, ties to the lower global index = bitwise the full-head greedy pick).  Call before the
+    /// buffers bind; the window builder reads it.  Needs the native head (its mixed rows are the handoff).
+    void set_split_heads(SplitHead* const* arr, int n) {
+        n_shead_ = 0;
+        for (int i = 0; i < 3; ++i) sheads_[i] = nullptr;
+        for (int i = 0; i < n && i < 3; ++i)
+            if (arr[i] != nullptr && arr[i]->on()) sheads_[n_shead_++] = arr[i];
+    }
+    int split_heads() const { return n_shead_; }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -496,6 +509,19 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+    // head split (set_split_heads): the parts, the main's row count (0 = not bound yet; n_vocab_ unsplit, the
+    // first part's split() with parts), the assembled full-vocab rows for the samplers, the mapped winning
+    // logits of the main's part (argmax_rows' out_val), and the handoff/done protocol counters.
+    SplitHead* sheads_[3] = {};
+    int n_shead_ = 0;
+    int64_t head_rows_ = 0;
+    float* head_full_ = nullptr;
+    float *h_val_ = nullptr, *m_val_ = nullptr;
+    uint32_t hand_n_ = 0, done_n_ = 0;
+    bool split_submitted_ = false;                   // the async batch path submits mid-poll, once a window
+    bool split_submit(int T, std::string& err, bool block);   // the peers start their parts (block: spin the handoff)
+    bool split_merge(int T, std::string& err);                // after the window: merge picks (+ head_full_)
+    bool split_logits_wanted() const;                    // this window's consumers will read the full-vocab rows
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
