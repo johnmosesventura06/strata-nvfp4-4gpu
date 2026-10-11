@@ -356,3 +356,22 @@ Ladder if np4 is ever wanted: (2) kv-resident 8192/slot → ~900 slots → pp ~1
 (0.6 s restore). Configs kept on ai-host: hs-np4-evict2.json, hs-armB-cache668.json; results
 /tmp/hs_np4b_results.txt, /tmp/hs_armB_results.txt.
 REVERTED: production np2 boot 14:1x (1520 slots, 2×1.39 GiB, parts ×3, probe exact).
+
+## RECORD CORRECTION (10-11 15:0x): the +8.2% was a morning-state reading
+
+Afternoon re-test (same interleaved design, same binary/config): engine-level deltas
+-4%/+3%/+0.7% (raw pairs 97.4/98.7, 96.2/99.1, 98.1/97.9 with accepts noted) vs morning
++8/+3/+5. Pooled across both sessions: **~+2-4%, state-dependent**. The adopted stack never
+read BELOW the winner in any paired round; W reproduces exactly across sessions (96.2-98.7)
+while S's absolute drifted (morning 101-105.3, afternoon 96.5-99.1).
+Exonerated confounds (measured): journal/parked sessions (fresh --conversation-cache-dir boot
+= 96.5, no better); expert cache size (1520 slots identical in every boot); VRAM/slot shape;
+binary (md5 ee752d3a unchanged since tag); config (md5-identical to banked copy); P2P fallback
+(no "fell back to mapped" in any scored boot). REMAINING open question (documented, unfixed):
+why S's absolute drifts by session while W does not — suspects left: unmeasured host/time-of-day
+interaction with the P2P/merge path, or the morning S boots benefiting from an unidentified
+transient. Next session's lever: same-day S-only repeatability series + STRATA_VERIFY_PROFILE
+stage stamps comparing morning/afternoon window internals.
+Adoption stands on: bitwise exactness (harness), quality gates, +2-4% pooled, zero paired-round
+regressions — NOT on +8.2%. README/PROJECT.md/writeup numbers corrected in the same pass
+(four-gpu frontpage commits).
