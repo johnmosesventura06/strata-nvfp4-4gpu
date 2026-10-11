@@ -7496,6 +7496,17 @@ int main(int argc, char** argv) {
         // the golden lane's journal semantics on the conversation cache. All of it runs on the park path and at
         // boot: no control lines, so it is sound with --batch slots too.
         size_t journal_pruned = 0;
+        // disk-direct journal index (docs/DISK-JOURNAL.md): header + live ids per file, a few MB each;
+        // the NVMe files are the source of truth, the RAM cache an optional accelerator in front of them
+        struct JournalEntry {
+            std::string path;
+            std::vector<int32_t> ids;
+            std::vector<std::vector<int32_t>> cks;   // the file's checkpoint id lists (the root rides here)
+            std::vector<strata::core::ConversationImageKey> imgs;
+            bool cvec = false;
+            uint64_t bytes = 0;
+        };
+        std::vector<JournalEntry> journal_index;
         auto journal_prune = [&] {
             const uint64_t cap = (uint64_t) std::max<int64_t>(1024, o.conversation_cache_disk_mib) << 20;
             std::error_code ec;
@@ -7515,6 +7526,8 @@ int main(int argc, char** argv) {
                 if (std::filesystem::remove(sp.second, rec) && !rec) {
                     total -= sp.first;
                     ++journal_pruned;
+                    journal_index.erase(std::remove_if(journal_index.begin(), journal_index.end(),
+                        [&](const JournalEntry& e) { return e.path == sp.second; }), journal_index.end());
                 }
             }
             std::fprintf(stderr, "strata serve: conversation journal: pruned to the cap, %zu file(s) deleted, %.1f GiB left\n",
@@ -7548,6 +7561,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: conversation journal: wrote %zu tokens, %.1f GiB in %.0f ms\n",
                          (size_t) image.live.ids.size(), (double) written / (1u << 30),
                          std::chrono::duration<double, std::milli>(Clock::now() - t0j).count());
+            // keep the disk index current: the file we just wrote is the deepest copy of this prefix
+            bool jr_replaced = false;
+            for (auto& e : journal_index)
+                if (e.path == path) {
+                    e.ids = image.live.ids; e.imgs = image.live.imgs; e.cvec = image.cvec; e.bytes = written;
+                    e.cks.clear();
+                    for (const auto& c : image.checkpoints) e.cks.push_back(c.ids);
+                    jr_replaced = true;
+                    break;
+                }
+            if (!jr_replaced) {
+                JournalEntry ne;
+                ne.path = path; ne.ids = image.live.ids; ne.imgs = image.live.imgs;
+                ne.cvec = image.cvec; ne.bytes = (uint64_t) written;
+                for (const auto& c : image.checkpoints) ne.cks.push_back(c.ids);
+                journal_index.push_back(std::move(ne));
+            }
             journal_prune();
         };
         auto journal_load = [&] {
@@ -7589,6 +7619,23 @@ int main(int argc, char** argv) {
             size_t ok = 0, rej = 0, kept = 0;
             uint64_t rb = 0;
             const auto t0l = Clock::now();
+            // disk index first (every boot, cheap): header + live ids/imgs only, no K/V read
+            for (auto& [mt, path] : fs) {
+                JournalEntry je;
+                uint64_t jb = 0;
+                std::string jerr;
+                if (strata::core::session_file_prefix_read(path, jid, je.ids, je.imgs, je.cvec, jb, jerr, limits, &je.cks)) {
+                    je.path = path;
+                    je.bytes = jb;
+                    journal_index.push_back(std::move(je));
+                } else {
+                    ++rej;
+                    std::fprintf(stderr, "strata serve: conversation journal: index skip %s (%s)\n", path.c_str(), jerr.c_str());
+                }
+            }
+            std::fprintf(stderr, "strata serve: conversation journal: %zu conversation(s) indexed on disk (%s)\n",
+                         journal_index.size(), conversations.enabled() ? "RAM cache on" : "disk-direct mode, RAM cache off");
+            if (conversations.enabled())
             for (auto& [mt, path] : fs) {
                 strata::core::SavedConversation img;
                 size_t bytes_read = 0;
@@ -7608,13 +7655,11 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(Clock::now() - t0l).count(),
                          conversations.size(), conversations.bytes());
         };
-        if (!o.conversation_cache_dir.empty() && conversations.enabled()) journal_load();
-        else if (!o.conversation_cache_dir.empty())
-            std::fprintf(stderr, "strata serve: --conversation-cache-dir needs --conversation-cache-mib > 0; the journal is off\n");
+        if (!o.conversation_cache_dir.empty()) journal_load();
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if ((!conversations.enabled() && o.conversation_cache_dir.empty()) || !live_ok || live.empty()) return true;
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
@@ -7685,11 +7730,15 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
+            const bool ram_room = !conversations.enabled() || conversations.make_room(estimate, held);
+            if (!ram_room && o.conversation_cache_dir.empty()) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
             }
+            if (!ram_room)
+                std::fprintf(stderr, "strata serve: conversation cache: RAM budget full (snapshot %zu MiB); the NVMe journal copy goes out anyway\n",
+                             estimate >> 20);
             const auto t0 = Clock::now();
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
@@ -7742,8 +7791,13 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
-                if (!o.conversation_cache_dir.empty() && conversations.enabled())
-                    journal_write(image, snapshot_bytes);   // the NVMe copy rides the park, before the image moves
+                if (!o.conversation_cache_dir.empty())
+                    journal_write(image, snapshot_bytes);   // NVMe first: durable whatever the RAM cache decides
+                if (!conversations.enabled()) {
+                    std::fprintf(stderr, "strata serve: conversation journal: disk-only park %zu tokens in %.1f ms (no RAM retention)\n",
+                                 live.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    return true;                            // the image frees right here: the journal holds no RAM
+                }
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
@@ -9560,6 +9614,21 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
+            if (line == "PARK") {   // server.py: the agent's turn ended - journal the live session as it stands (docs/DISK-JOURNAL.md)
+                const auto tp0 = Clock::now();
+                if (!live_ok || live.empty())
+                    std::printf("PARKSKIP no live session\n");
+                else if (o.conversation_cache_dir.empty() && !conversations.enabled())
+                    std::printf("PARKSKIP no journal dir and no RAM cache\n");
+                else if (!park_current(0)) {
+                    err.clear();   // a failed park must not poison the next request's error channel
+                    std::printf("PARKSKIP capture failed\n");
+                } else
+                    std::printf("PARKED %zu %.0f\n", live.size(),
+                                std::chrono::duration<double, std::milli>(Clock::now() - tp0).count());
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
                 const std::string path = line.substr(save ? 5 : 8);
@@ -10011,9 +10080,78 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            // disk-direct journal mount (docs/DISK-JOURNAL.md, owner 10-12): the deepest prefix the prompt shares
+            // with an indexed NVMe file streams through the ordinary incoming path. RAM holds only the transient
+            // read image (admit-guarded), freed the moment the device transfer completes.
+            if (!journal_index.empty()) {
+                const int64_t floor_tok = std::max<int64_t>({parked.tokens, resume, slot_tokens});
+                // the file's checkpoints are the ONLY legal resume points (the restore looks for a checkpoint
+                // whose length EQUALS resume) - so candidates are the file's live length and each checkpoint
+                // length, each required to be a true prefix of this prompt, <= n-1, and >= the root floor:
+                // below that a fresh read beats transferring a whole snapshot
+                auto full_prefix = [&](const std::vector<int32_t>& v) -> bool {
+                    for (size_t i2 = 0; i2 < v.size(); ++i2)
+                        if ((int32_t) ids[i2] != v[i2]) return false;
+                    return true;
+                };
+                size_t bj = SIZE_MAX;
+                int64_t bj_depth = 0;
+                for (size_t j = 0; j < journal_index.size(); ++j) {
+                    const auto& e = journal_index[j];
+                    if (e.cvec != want_cvec) continue;
+                    int64_t d = -1;
+                    if (req_imgs.empty() && e.imgs.empty())
+                        for (const auto& cv : e.cks)   // checkpoints ONLY: resume must equal one of them exactly
+                            if ((int64_t) cv.size() > d && (int64_t) cv.size() <= n - 1 && full_prefix(cv))
+                                d = (int64_t) cv.size();
+                    if (d < 2048 || d <= floor_tok || d > n - 1) continue;
+                    if (bj != SIZE_MAX && d <= bj_depth) continue;
+                    bj = j;
+                    bj_depth = d;
+                }
+                if (bj != SIZE_MAX) {
+                    const int64_t dj_tokens = bj_depth;
+                    const std::string dj_path = journal_index[bj].path;
+                    journal_index.erase(journal_index.begin() + (long) bj);   // live here now; the next park re-files it deeper
+                    strata::core::SessionFileIdentity jid;
+                    std::string je, jerr;
+                    bool jready = false;
+                    strata::core::SessionReadLimits jlim;
+                    if (session_identity(jid, je, [] {})) {
+                        jlim.max_file_bytes = (uint64_t) std::max<int64_t>(1024, o.conversation_cache_disk_mib) << 20;
+                        const uint64_t jfloor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        jlim.admit = [jfloor](uint64_t need, std::string& why) {
+                            const auto avail = strata::core::conversation_available_memory();
+                            if (strata::core::conversation_memory_admit(avail, need, jfloor)) return true;
+                            why = "not enough RAM to mount the journal file (" + std::to_string(need >> 20) + " MiB transient)";
+                            return false;
+                        };
+                        jready = strata::core::conversation_session_read_limits(
+                            jlim, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                            (uint64_t) std::max(o.prompt_cache, 1), jerr);
+                        if (!jready) jerr = "journal mount limits: " + jerr;
+                    } else
+                        jerr = "journal mount: " + je;
+                    if (jready) {
+                        const auto t0j = Clock::now();
+                        strata::core::SavedConversation img;
+                        size_t jb = 0;
+                        if (strata::core::session_file_read(dj_path, jid, img, jb, jerr, jlim)) {
+                            incoming.emplace(std::move(img));
+                            parked = {SIZE_MAX, dj_tokens, false};
+                            std::fprintf(stderr, "strata serve: conversation journal: mounted %lld tokens (%.1f GiB) from disk in %.0f ms\n",
+                                         (long long) dj_tokens, (double) jb / (1u << 30),
+                                         std::chrono::duration<double, std::milli>(Clock::now() - t0j).count());
+                        }
+                    }
+                    if (!incoming)
+                        std::fprintf(stderr, "strata serve: conversation journal: mount of %s refused (%s); reading the prompt instead\n",
+                                     dj_path.c_str(), jerr.c_str());
+                }
+            }
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.

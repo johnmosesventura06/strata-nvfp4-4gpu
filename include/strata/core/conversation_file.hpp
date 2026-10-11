@@ -235,6 +235,16 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
+// The cheap index read for the disk-direct journal: header + identity checks and the LIVE state's token ids and
+// image keys only, stopping before the checkpoints and the K/V buffers (a few MB, not GBs). No payload hash is
+// computed (the file is only half-read); this authenticates nothing beyond the header and identity - a mount must
+// still session_file_read the whole file and validate. `cvec` and `file_bytes` come from the parsed header region.
+bool session_file_prefix_read(const std::string& path, const SessionFileIdentity& id,
+                              std::vector<int32_t>& ids, std::vector<ConversationImageKey>& imgs,
+                              bool& cvec, uint64_t& file_bytes, std::string& error,
+                              const SessionReadLimits& limits = {},
+                              std::vector<std::vector<int32_t>>* ck_ids = nullptr);
+
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).

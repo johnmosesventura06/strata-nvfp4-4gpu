@@ -762,7 +762,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+bool get_payload(In& in, SavedConversation& s, bool stop_after_checkpoints = false) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -780,6 +780,9 @@ bool get_payload(In& in, SavedConversation& s) {
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    // the disk index needs the live + checkpoint id lists only; the K/V buffers (GBs) are the whole cost,
+    // so the prefix read stops here and the mount re-reads the file whole through the normal path
+    if (stop_after_checkpoints) return true;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
@@ -1251,6 +1254,52 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+bool session_file_prefix_read(const std::string& path, const SessionFileIdentity& id,
+                              std::vector<int32_t>& ids, std::vector<ConversationImageKey>& imgs,
+                              bool& cvec, uint64_t& file_bytes, std::string& error,
+                              const SessionReadLimits& limits,
+                              std::vector<std::vector<int32_t>>* ck_ids) {
+    error.clear();
+    try {
+        RawFile raw;
+        uint64_t size = 0;
+        if (!raw.open_session(path, size)) { error = "session file: " + path + ": " + raw.error(); return false; }
+        if (size < kHeader + kTrailer) { error = "session file: size below the minimum"; return false; }
+        const uint64_t max_size = session_read_max_file_bytes(limits);
+        if (size > max_size) { error = "session file: size exceeds this engine's limit"; return false; }
+        FileSource f(raw);
+        if (!f.ok()) { error = "session file: " + f.error(); return false; }
+        f.expected = size;
+        uint8_t h[kHeader];
+        if (!f.read(h, kHeader)) { error = "session file: header read error: " + f.error(); return false; }
+        uint32_t version = 0, hsize = 0;
+        uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+        std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+        std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+        std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+        if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+        if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
+        if (version != kVersion) { error = "session file: unsupported version"; return false; }
+        if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+        if (model != id.model || config != id.config) { error = "session file: identity differs"; return false; }
+        if (payload > size || size - kHeader - kTrailer != payload) { error = "session file: size does not match the header"; return false; }
+        // parse live + checkpoints through the ENGINE's own get_payload (identical byte layout, no reimplementation),
+        // stopping before the K/V buffers; the state arrays are a few MB, the K/V is the GB we skip
+        SavedConversation parsed;
+        In in{&f, SessionHasher(0), payload, error, limits};
+        if (!get_payload(in, parsed, true)) return false;
+        ids = std::move(parsed.live.ids);
+        imgs = std::move(parsed.live.imgs);
+        cvec = parsed.cvec;
+        file_bytes = size;
+        if (ck_ids) for (const auto& c : parsed.checkpoints) ck_ids->push_back(c.ids);
+        return true;
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while indexing " + path;
+        return false;
+    }
 }
 
 } // namespace strata::core

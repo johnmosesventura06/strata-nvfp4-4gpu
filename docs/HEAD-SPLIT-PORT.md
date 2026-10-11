@@ -433,3 +433,33 @@ per-layer stall point (combine waits the peer's last group of the layer either w
 Remaining levers, ranked: PLE token-contiguous repack (the single-chunk TTFT floor, all sizes);
 session fast/slow investigation (contaminates every cross-boot A/B on this lane); tensor
 parallelism (the only all-GPU-trunk answer, ~3x ceiling, weeks-scale, absent from both repos).
+
+## RAM-claim mechanism PROVEN + final production = 6144 chunk + mib 0 (10-11 night, owner GO)
+
+The session fast/slow drift that contaminated every cross-boot A/B today is ONE mechanism:
+--conversation-cache-mib pins restored journal KV in UNRECLAIMABLE shmem; as sessions park, the
+claim grows (MemAvailable 30.7 -> 26.1 -> 19.2 -> 16.7 GiB through the day) and evicts the 26.8 GB
+PLE n-gram table from page cache, so every verify window and prefill chunk re-reads PLE rows from
+NVMe. Controlled aged A/B (same traffic aging, same boot age): claim 16G = pp 1135 / tg 86.8;
+claim 0 = pp 1543 / tg 105.5 (+36% / +22%). Boot always reads the whole journal (~100 GiB, ~32 s)
+into reclaimable page cache regardless of mib; mib only controls the unreclaimable slice.
+Owner chose mib 0 for production (no pinned slice; journal resumes via page cache, NVMe fallback
+under pressure; parking unaffected). Chunk reverted 4096 -> 6144: with mib 0 the 3K bench reads
+1562/106.6/1.97s at 6144 vs 1543/105.5 at 4096 (tie) while 16.7K stays 6144's 1824-1875 vs
+4096's 1666-1758 — the 4096 adoption was itself a claim-confound artifact; retracted here.
+Final production: nvfp4-512k-np2-vision.json = winner base + head split + --prefill 6144 +
+--conversation-cache-mib 0. Backups .bak-20261011-pre-cache8g (16384) / .bak-20261011-pre-6144m0
+(4096+mib0). Rollback kit checkpoint = checkpoint-8g-4096 file, now the 6144+mib0 content.
+Open: journal regrew to ~100G from matrix parking (boot pays ~32s restore read) — prune pending
+owner GO (second time). PLE token-contiguous repack still the remaining single-chunk TTFT lever.
+
+### Final table on production 6144+mib0 (10-11 21:47-22:03, single run per cell, owner screenshot table)
+| actual in / out | pp | tg | ttft |
+| 14,567 / 1,024 | 1846.2 | 101.9 | 7.89 |
+| 54,127 / 4,096 | 1891.3 | 100.7 | 28.62 |
+| 97,987 / 8,192 | 1839.8 | 101.4 | 53.26 |
+| 194,522 / 16,384 | 1739.2 | 95.6 | 111.85 |
+| 212,367 / 16,384 | 1722.9 | 97.5 | 123.26 |
+Aged bench after the table: pp 1515.5 / tg 108.0 / ttft 2.03; MemAvailable 25.6 GiB (no claim
+growth). vs the Reddit tester's C1 (997/81.5, 956/69.2, 902/69.7, 872/67.3 on Zen2+DDR4+PCIe4+fp8
+PLE): ~1.9x pp and flat vs his -12.5%/-17% decay.
