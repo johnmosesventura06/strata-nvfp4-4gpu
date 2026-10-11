@@ -11,7 +11,7 @@
     "--native-dense-gguf",
     "../models/qwen-nvfp4-gptq/qwen-nvfp4-gptq-dense.gguf",
     "--ple-gguf",
-    "../models/orca-nvfp4/ple-bf16.gguf",
+    "../models/original-tables/ple-bf16.gguf",
     "--embd-gguf",
     "../models/qwen-nvfp4-gptq/token-embd-bf16.gguf",
     "--mtp",
@@ -77,7 +77,7 @@
   "parallel": 2,
   "vision": {
     "exe": "build-vision-cpu/bin/strata-vision",
-    "mmproj": "../models/orca-nvfp4/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "mmproj": "../models/original-tables/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
     "model": "../models/qwen-nvfp4-gptq/qwen-nvfp4-gptq-dense.gguf",
     "gpu": false,
     "max_tokens": 1024

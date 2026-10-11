@@ -5,17 +5,17 @@
  "model_name": "strata-nvfp4-512k",
  "args": [
   "--pack",
-  "../models/orca-nvfp4/pack",
+  "../models/qwen-nvfp4-gptq/pack",
   "--native",
-  "../models/orca-nvfp4/orca-nvfp4-dense.gguf",
+  "../models/qwen-nvfp4-gptq/qwen-nvfp4-gptq-dense.gguf",
   "--native-dense-gguf",
-  "../models/orca-nvfp4/orca-nvfp4-dense.gguf",
+  "../models/qwen-nvfp4-gptq/qwen-nvfp4-gptq-dense.gguf",
   "--ple-gguf",
-  "../models/orca-nvfp4/ple-bf16.gguf",
+  "../models/original-tables/ple-bf16.gguf",
   "--embd-gguf",
-  "../models/orca-nvfp4/token-embd-bf16.gguf",
+  "../models/qwen-nvfp4-gptq/token-embd-bf16.gguf",
   "--mtp",
-  "../models/orca-nvfp4/mtp",
+  "../models/qwen-nvfp4-gptq/mtp",
   "--spec",
   "6",
   "--spec-min-p",
@@ -40,7 +40,7 @@
   "--mtp-draft-vocab",
   "data/draft_vocab_en.bin",
   "--native-head-gguf",
-  "../models/orca-nvfp4/orca-nvfp4-dense.gguf",
+  "../models/qwen-nvfp4-gptq/qwen-nvfp4-gptq-dense.gguf",
   "--head-split",
   "0.7515",
   "--kv-resident",
@@ -62,7 +62,7 @@
   "presence_penalty": 0.0,
   "repetition_penalty": 1.0
  },
- "tokenizer": "../models/orca-nvfp4/pack/tokenizer",
+ "tokenizer": "../models/qwen-nvfp4-gptq/pack/tokenizer",
  "env": {
   "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
   "STRATA_PREFILL_CPU_SHARE": "auto",
@@ -73,8 +73,8 @@
  "parallel": 4,
  "vision": {
   "exe": "build-vision-cpu/bin/strata-vision",
-  "mmproj": "../models/orca-nvfp4/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
-  "model": "../models/orca-nvfp4/orca-nvfp4-dense.gguf",
+  "mmproj": "../models/original-tables/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "model": "../models/qwen-nvfp4-gptq/qwen-nvfp4-gptq-dense.gguf",
   "gpu": false,
   "max_tokens": 1024
  }
