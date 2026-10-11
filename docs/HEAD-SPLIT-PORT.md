@@ -375,3 +375,16 @@ stage stamps comparing morning/afternoon window internals.
 Adoption stands on: bitwise exactness (harness), quality gates, +2-4% pooled, zero paired-round
 regressions — NOT on +8.2%. README/PROJECT.md/writeup numbers corrected in the same pass
 (four-gpu frontpage commits).
+
+## Two shipping shapes (10-11, owner buttons on the ai-host desktop)
+
+- production: configs/nvfp4-512k-np2-vision.json — np2, 512K YaRN, ~1520 expert slots,
+  pp 1824-1875, decode 97-105 single-stream / 104-106 two-stream aggregate.
+- concurrency: configs/np4-262k.json — np4, 262K stock rope, full 32768 pins, 1255 expert
+  slots, pp ~1880 (NO cliff: 1255 slots stays above the ~668 streaming cliff), 4 streams
+  26.7-27.4 t/s each = 106.9 aggregate, 1-stream 97.0.
+Aggregate throughput is the trunk ceiling (~105-110) in every shape; the shapes trade
+per-stream speed + context depth against session count. Desktop buttons (ai-host):
+strata-np2-512k.desktop / strata-np4-262k.desktop → ~/bin/strata-shape.sh <cfg>
+(attach if same shape live, SWITCH if another shape is live, eject :8000 holders by name,
+readiness = /health only). Switch paths tested headlessly 10-11 15:4x.
