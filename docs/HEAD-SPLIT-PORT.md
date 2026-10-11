@@ -388,3 +388,48 @@ per-stream speed + context depth against session count. Desktop buttons (ai-host
 strata-np2-512k.desktop / strata-np4-262k.desktop → ~/bin/strata-shape.sh <cfg>
 (attach if same shape live, SWITCH if another shape is live, eject :8000 holders by name,
 readiness = /health only). Switch paths tested headlessly 10-11 15:4x.
+
+## Prefill chunk-size matrix (10-11 evening) — CONFOUNDED, DO NOT USE FOR DECISIONS
+# WARNING: every arm below crossed boots, and this lane has a session fast/slow phenomenon
+# (same config, same prompt: TTFT 2.84 s at 18:26 vs 2.08 s at 18:58 on 6144). Cross-boot chunk
+# comparisons are therefore unreliable; the only within-boot paired probes (tail sizes) showed
+# 6144 >= 4096, contradicting the cross-boot ordering. Kept as raw data pending an interleaved
+# 6144/4096 boot-pair A/B and/or naming the session-drift mechanism (the open problem that
+# contaminates every A/B on this lane, head-split delta included).
+## Prefill chunk-size matrix (10-11 evening, owner bench bench-3k500 = 3079 tok in / 500 out)
+
+Owner's bench read pp 1024-1120 on production (--prefill 6144) vs the 1824-1875 headline: NOT a
+regression — a 3K prompt is ONE 6144-chunk, so the PLE gather (~0.38 ms/token warm, ~1.2 s at 3K;
+16 separate page faults per token into the 26.8 GB bf16 mapping; prefetch already ON by default,
+--no-ple-prefetch is the opt-out) runs SERIAL inside TTFT. Multi-chunk prompts pipeline each
+chunk's gather behind the previous chunk's compute, which is where the 1830 headline lives.
+Measured arms (np2@512K production otherwise identical):
+| chunk | bench 3K pp / TTFT | 8K pp | 16.7K pp |
+| 6144 (prod) | 1086 / 2.84 s | ~1750-1800 | 1824-1875 |
+| 3072 | 1343 / 2.31 s (+24%) | 1545-1626 | 1574-1630 (-11-13%) |
+| 2048 | 1108 / 2.79 s | 1386-1446 | 1388-1433 (-22-24%) |
+3072 wins only the 3-6K window; below ~3K all sizes are single-chunk (neutral); above 6K the
+smaller-chunk compute tax dominates. Owner traffic (deep-history turns, new tokens usually <3K)
+is the neutral zone → 6144 stays production. 2048 dominated everywhere, retired untested-further.
+THE REAL FIX (open project, owner GO pending): repack the PLE table token-contiguous (16 head
+rows per token adjacent) so the gather is one read per token instead of sixteen faults — cuts
+the ~1.2 s serial first-chunk gather at EVERY prompt size (bench 3K → ~1600 pp, 16.7K → ~1950+,
+turn-tail TTFT up across the board). Touches tools/ple_bf16_pack.py layout + the engine's gather
+indexing + full re-verification battery.
+
+## 4096 chunk ADOPTED + peer-prefill confirmed (10-11 evening, owner GO)
+
+Production --prefill 6144 -> 4096 adopted (owner: "just keep 4096"): bench-3k500 shape reads
+1248-1439 pp / TTFT 2.14-2.47 s at 4096 (session-drift spread) vs 1024-1120 / 2.84 s at 6144 in
+the same evening's slow session; 16.7K pp costs -5-8% (1666-1758 vs 1824-1875). Backup
+.bak-20261011-pre-prefill4096; rollback kit ~/strata-nvfp4/rollback-20261011-evening/RESTORE.sh
+checkpoints the 4096 state (binary md5-verified against the tag, config snapshot, experiment
+configs quarantined, reboot + health verify).
+PEER TIER PREFILL A/B (bracketed, bench shape, 4096 chunk): on 1248/1439 vs off 1130 -> the tier
+pipeline contributes +10-27% even on single-chunk prompts; it stays on (it was never the stall).
+The GGUF-repo "per-piece xfer/xsum" port was evaluated and DROPPED: our per-group second-stream
+returns with double buffering are finer-grained, and incremental combine cannot move the
+per-layer stall point (combine waits the peer's last group of the layer either way).
+Remaining levers, ranked: PLE token-contiguous repack (the single-chunk TTFT floor, all sizes);
+session fast/slow investigation (contaminates every cross-boot A/B on this lane); tensor
+parallelism (the only all-GPU-trunk answer, ~3x ceiling, weeks-scale, absent from both repos).
