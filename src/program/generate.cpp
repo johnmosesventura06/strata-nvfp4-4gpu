@@ -7501,6 +7501,7 @@ int main(int argc, char** argv) {
         struct JournalEntry {
             std::string path;
             std::vector<int32_t> ids;
+            std::vector<std::vector<int32_t>> cks;   // the file's checkpoint id lists (the root rides here)
             std::vector<strata::core::ConversationImageKey> imgs;
             bool cvec = false;
             uint64_t bytes = 0;
@@ -7565,11 +7566,18 @@ int main(int argc, char** argv) {
             for (auto& e : journal_index)
                 if (e.path == path) {
                     e.ids = image.live.ids; e.imgs = image.live.imgs; e.cvec = image.cvec; e.bytes = written;
+                    e.cks.clear();
+                    for (const auto& c : image.checkpoints) e.cks.push_back(c.ids);
                     jr_replaced = true;
                     break;
                 }
-            if (!jr_replaced)
-                journal_index.push_back({path, image.live.ids, image.live.imgs, image.cvec, (uint64_t) written});
+            if (!jr_replaced) {
+                JournalEntry ne;
+                ne.path = path; ne.ids = image.live.ids; ne.imgs = image.live.imgs;
+                ne.cvec = image.cvec; ne.bytes = (uint64_t) written;
+                for (const auto& c : image.checkpoints) ne.cks.push_back(c.ids);
+                journal_index.push_back(std::move(ne));
+            }
             journal_prune();
         };
         auto journal_load = [&] {
@@ -7616,7 +7624,7 @@ int main(int argc, char** argv) {
                 JournalEntry je;
                 uint64_t jb = 0;
                 std::string jerr;
-                if (strata::core::session_file_prefix_read(path, jid, je.ids, je.imgs, je.cvec, jb, jerr, limits)) {
+                if (strata::core::session_file_prefix_read(path, jid, je.ids, je.imgs, je.cvec, jb, jerr, limits, &je.cks)) {
                     je.path = path;
                     je.bytes = jb;
                     journal_index.push_back(std::move(je));
@@ -10080,20 +10088,33 @@ int main(int argc, char** argv) {
             // read image (admit-guarded), freed the moment the device transfer completes.
             if (!journal_index.empty()) {
                 const int64_t floor_tok = std::max<int64_t>({parked.tokens, resume, slot_tokens});
+                // the deepest prefix the prompt shares with any indexed file - through its live state OR any
+                // of its checkpoints (a fresh session shares only the header; the root checkpoint holds it)
+                auto depth_of = [&](const std::vector<int32_t>& v) -> int64_t {
+                    const int64_t L = std::min<int64_t>((int64_t) v.size(), n - 1);
+                    int64_t i2 = 0;
+                    for (; i2 < L; ++i2) if ((int32_t) ids[(size_t) i2] != v[(size_t) i2]) break;
+                    return i2;
+                };
                 size_t bj = SIZE_MAX;
+                int64_t bj_depth = 0;
                 for (size_t j = 0; j < journal_index.size(); ++j) {
                     const auto& e = journal_index[j];
-                    const int64_t L = (int64_t) e.ids.size();
-                    if (L <= floor_tok || L > n - 1 || e.cvec != want_cvec) continue;
-                    if (bj != SIZE_MAX && L <= (int64_t) journal_index[bj].ids.size()) continue;
-                    bool pre = true;
-                    for (int64_t i2 = 0; i2 < L; ++i2)
-                        if ((int32_t) ids[(size_t) i2] != e.ids[(size_t) i2]) { pre = false; break; }
-                    if (!pre || imgs_below(req_imgs, L) != e.imgs) continue;
+                    if (e.cvec != want_cvec) continue;
+                    int64_t d = -1;
+                    if (req_imgs.empty() && e.imgs.empty()) {
+                        d = depth_of(e.ids);
+                        for (const auto& cv : e.cks) d = std::max(d, depth_of(cv));
+                    } else if ((int64_t) e.ids.size() <= n - 1 && imgs_below(req_imgs, (int64_t) e.ids.size()) == e.imgs) {
+                        d = depth_of(e.ids);   // image conversations: only the exact full-live prefix counts
+                    }
+                    if (d <= floor_tok || d > n - 1) continue;
+                    if (bj != SIZE_MAX && d <= bj_depth) continue;
                     bj = j;
+                    bj_depth = d;
                 }
                 if (bj != SIZE_MAX) {
-                    const int64_t dj_tokens = (int64_t) journal_index[bj].ids.size();
+                    const int64_t dj_tokens = bj_depth;
                     const std::string dj_path = journal_index[bj].path;
                     journal_index.erase(journal_index.begin() + (long) bj);   // live here now; the next park re-files it deeper
                     strata::core::SessionFileIdentity jid;

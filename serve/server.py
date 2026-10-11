@@ -605,6 +605,9 @@ class StrataEngine:
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        # disk-direct journal (docs/DISK-JOURNAL.md): with a journal dir the server parks the conversation on
+        # NVMe at every agent-turn end; the engine answers PARKED/PARKSKIP on the pump (swallowed there)
+        self.journal_dir = args[args.index("--conversation-cache-dir") + 1] if "--conversation-cache-dir" in args else None
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
@@ -751,6 +754,10 @@ class StrataEngine:
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            # the PARK ack of a turn-end journal (docs/DISK-JOURNAL.md): a control fact, never a protocol line
+            if line.startswith(("PARKED ", "PARKSKIP ")):
+                print(f"[strata] {line.strip()}", flush=True)
+                continue
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -4116,6 +4123,16 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+            # turn end (docs/DISK-JOURNAL.md, owner 10-12): with a journal dir, park the conversation NOW -
+            # "tool_calls" finishes are steps, this is the agent's turn actually ending. Fire-and-forget:
+            # the engine runs it at its next idle read; the PARKED ack dies in the pump.
+            if finish == "stop" and getattr(svc.engine, "journal_dir", None):
+                send = getattr(svc.engine, "_send", None)
+                try:
+                    if callable(send):
+                        send("PARK")
+                except Exception:
+                    pass
             yield last
 
 

@@ -242,7 +242,8 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 bool session_file_prefix_read(const std::string& path, const SessionFileIdentity& id,
                               std::vector<int32_t>& ids, std::vector<ConversationImageKey>& imgs,
                               bool& cvec, uint64_t& file_bytes, std::string& error,
-                              const SessionReadLimits& limits = {});
+                              const SessionReadLimits& limits = {},
+                              std::vector<std::vector<int32_t>>* ck_ids = nullptr);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
