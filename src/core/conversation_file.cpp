@@ -762,7 +762,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+bool get_payload(In& in, SavedConversation& s, bool stop_after_checkpoints = false) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -780,6 +780,9 @@ bool get_payload(In& in, SavedConversation& s) {
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    // the disk index needs the live + checkpoint id lists only; the K/V buffers (GBs) are the whole cost,
+    // so the prefix read stops here and the mount re-reads the file whole through the normal path
+    if (stop_after_checkpoints) return true;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
@@ -1282,69 +1285,16 @@ bool session_file_prefix_read(const std::string& path, const SessionFileIdentity
         if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
         if (model != id.model || config != id.config) { error = "session file: identity differs"; return false; }
         if (payload > size || size - kHeader - kTrailer != payload) { error = "session file: size does not match the header"; return false; }
-        // consume exactly: geometry, layer range, cvec, the live checkpoint's ids and imgs - then stop.
-        // (the state arrays after imgs are skipped by the caller never reading them: the mount re-reads whole)
+        // parse live + checkpoints through the ENGINE's own get_payload (identical byte layout, no reimplementation),
+        // stopping before the K/V buffers; the state arrays are a few MB, the K/V is the GB we skip
         SavedConversation parsed;
         In in{&f, SessionHasher(0), payload, error, limits};
-        for (auto& g : parsed.geometry) if (!in.i64(g)) return false;
-        if (limits.geometry && *limits.geometry != parsed.geometry) { error = "session file: another model geometry"; return false; }
-        uint64_t cv = 0;
-        if (!in.i64(parsed.layer_lo) || !in.i64(parsed.layer_hi) || !in.u64(cv)) return false;
-        if (cv > 1) { error = "session file: invalid cvec flag"; return false; }
-        if (limits.layer_range && (limits.layer_range->first != parsed.layer_lo || limits.layer_range->second != parsed.layer_hi)) {
-            error = "session file: another layer range"; return false;
-        }
-        if (!in.vec(parsed.live.ids, limits.max_tokens)) return false;
-        uint64_t n = 0;
-        if (!in.count(n, 16, limits.max_tokens)) return false;
-        parsed.live.imgs.resize((size_t) n);
-        for (auto& k : parsed.live.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
-        // walk past the checkpoint state arrays to the checkpoint id lists: a fresh session mounts through the
-        // file's ROOT checkpoint (the stable header), which lives in image.checkpoints, not in live.ids
-        auto skip_vec = [&](const uint64_t m) -> bool {
-            uint64_t c = 0;
-            if (!in.count(c, 1, m)) return false;
-            static constexpr size_t kScratch = 1u << 16;
-            std::vector<uint8_t> scratch;
-            while (c) {
-                const size_t chunk = (size_t) std::min<uint64_t>(c, kScratch);
-                if (scratch.size() < chunk) scratch.resize(chunk);
-                if (!in.raw(scratch.data(), chunk)) return false;
-                c -= chunk;
-            }
-            return true;
-        };
-        auto get_ck_ids_only = [&](std::vector<int32_t>* out) -> bool {
-            uint64_t cnt = 0;
-            if (!in.count(cnt, sizeof(int32_t), limits.max_tokens)) return false;
-            std::vector<int32_t> v;
-            if (!in.vec(v, limits.max_tokens)) return false;
-            if (!in.count(n, 16, limits.max_tokens)) return false;
-            for (uint64_t q = 0; q < n; ++q) { int64_t s0; uint64_t h0; if (!in.i64(s0) || !in.u64(h0)) return false; }
-            if (!skip_vec(limits.max_state_bytes[0]) || !skip_vec(limits.max_state_bytes[1]) ||
-                !skip_vec(limits.max_state_bytes[2]) || !skip_vec(limits.max_state_bytes[3]) ||
-                !skip_vec(limits.max_state_bytes[4])) return false;
-            uint64_t used = 0;
-            if (!in.u64(used)) return false;
-            if (out) *out = std::move(v);
-            return true;
-        };
-        // the live record's remaining fields: its state arrays + used (its ids/imgs were read above)
-        if (!skip_vec(limits.max_state_bytes[0]) || !skip_vec(limits.max_state_bytes[1]) ||
-            !skip_vec(limits.max_state_bytes[2]) || !skip_vec(limits.max_state_bytes[3]) ||
-            !skip_vec(limits.max_state_bytes[4])) return false;
-        { uint64_t used = 0; if (!in.u64(used)) return false; }
-        uint64_t nck = 0;
-        if (!in.count(nck, 72, limits.max_checkpoints)) return false;
-        for (uint64_t q = 0; q < nck; ++q) {
-            std::vector<int32_t> cv;
-            if (!get_ck_ids_only(&cv)) return false;
-            if (ck_ids) ck_ids->push_back(std::move(cv));
-        }
+        if (!get_payload(in, parsed, true)) return false;
         ids = std::move(parsed.live.ids);
         imgs = std::move(parsed.live.imgs);
-        cvec = cv == 1;
+        cvec = parsed.cvec;
         file_bytes = size;
+        if (ck_ids) for (const auto& c : parsed.checkpoints) ck_ids->push_back(c.ids);
         return true;
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while indexing " + path;
