@@ -452,3 +452,14 @@ Final production: nvfp4-512k-np2-vision.json = winner base + head split + --pref
 (4096+mib0). Rollback kit checkpoint = checkpoint-8g-4096 file, now the 6144+mib0 content.
 Open: journal regrew to ~100G from matrix parking (boot pays ~32s restore read) — prune pending
 owner GO (second time). PLE token-contiguous repack still the remaining single-chunk TTFT lever.
+
+### Final table on production 6144+mib0 (10-11 21:47-22:03, single run per cell, owner screenshot table)
+| actual in / out | pp | tg | ttft |
+| 14,567 / 1,024 | 1846.2 | 101.9 | 7.89 |
+| 54,127 / 4,096 | 1891.3 | 100.7 | 28.62 |
+| 97,987 / 8,192 | 1839.8 | 101.4 | 53.26 |
+| 194,522 / 16,384 | 1739.2 | 95.6 | 111.85 |
+| 212,367 / 16,384 | 1722.9 | 97.5 | 123.26 |
+Aged bench after the table: pp 1515.5 / tg 108.0 / ttft 2.03; MemAvailable 25.6 GiB (no claim
+growth). vs the Reddit tester's C1 (997/81.5, 956/69.2, 902/69.7, 872/67.3 on Zen2+DDR4+PCIe4+fp8
+PLE): ~1.9x pp and flat vs his -12.5%/-17% decay.
