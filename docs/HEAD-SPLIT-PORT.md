@@ -389,6 +389,13 @@ strata-np2-512k.desktop / strata-np4-262k.desktop → ~/bin/strata-shape.sh <cfg
 (attach if same shape live, SWITCH if another shape is live, eject :8000 holders by name,
 readiness = /health only). Switch paths tested headlessly 10-11 15:4x.
 
+## Prefill chunk-size matrix (10-11 evening) — CONFOUNDED, DO NOT USE FOR DECISIONS
+# WARNING: every arm below crossed boots, and this lane has a session fast/slow phenomenon
+# (same config, same prompt: TTFT 2.84 s at 18:26 vs 2.08 s at 18:58 on 6144). Cross-boot chunk
+# comparisons are therefore unreliable; the only within-boot paired probes (tail sizes) showed
+# 6144 >= 4096, contradicting the cross-boot ordering. Kept as raw data pending an interleaved
+# 6144/4096 boot-pair A/B and/or naming the session-drift mechanism (the open problem that
+# contaminates every A/B on this lane, head-split delta included).
 ## Prefill chunk-size matrix (10-11 evening, owner bench bench-3k500 = 3079 tok in / 500 out)
 
 Owner's bench read pp 1024-1120 on production (--prefill 6144) vs the 1824-1875 headline: NOT a
