@@ -1253,4 +1253,60 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     return ok;
 }
 
+bool session_file_prefix_read(const std::string& path, const SessionFileIdentity& id,
+                              std::vector<int32_t>& ids, std::vector<ConversationImageKey>& imgs,
+                              bool& cvec, uint64_t& file_bytes, std::string& error,
+                              const SessionReadLimits& limits) {
+    error.clear();
+    try {
+        RawFile raw;
+        uint64_t size = 0;
+        if (!raw.open_session(path, size)) { error = "session file: " + path + ": " + raw.error(); return false; }
+        if (size < kHeader + kTrailer) { error = "session file: size below the minimum"; return false; }
+        const uint64_t max_size = session_read_max_file_bytes(limits);
+        if (size > max_size) { error = "session file: size exceeds this engine's limit"; return false; }
+        FileSource f(raw);
+        if (!f.ok()) { error = "session file: " + f.error(); return false; }
+        f.expected = size;
+        uint8_t h[kHeader];
+        if (!f.read(h, kHeader)) { error = "session file: header read error: " + f.error(); return false; }
+        uint32_t version = 0, hsize = 0;
+        uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+        std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+        std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+        std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+        if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+        if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
+        if (version != kVersion) { error = "session file: unsupported version"; return false; }
+        if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+        if (model != id.model || config != id.config) { error = "session file: identity differs"; return false; }
+        if (payload > size || size - kHeader - kTrailer != payload) { error = "session file: size does not match the header"; return false; }
+        // consume exactly: geometry, layer range, cvec, the live checkpoint's ids and imgs - then stop.
+        // (the state arrays after imgs are skipped by the caller never reading them: the mount re-reads whole)
+        SavedConversation parsed;
+        In in{&f, SessionHasher(0), payload, error, limits};
+        for (auto& g : parsed.geometry) if (!in.i64(g)) return false;
+        if (limits.geometry && *limits.geometry != parsed.geometry) { error = "session file: another model geometry"; return false; }
+        uint64_t cv = 0;
+        if (!in.i64(parsed.layer_lo) || !in.i64(parsed.layer_hi) || !in.u64(cv)) return false;
+        if (cv > 1) { error = "session file: invalid cvec flag"; return false; }
+        if (limits.layer_range && (limits.layer_range->first != parsed.layer_lo || limits.layer_range->second != parsed.layer_hi)) {
+            error = "session file: another layer range"; return false;
+        }
+        if (!in.vec(parsed.live.ids, limits.max_tokens)) return false;
+        uint64_t n = 0;
+        if (!in.count(n, 16, limits.max_tokens)) return false;
+        parsed.live.imgs.resize((size_t) n);
+        for (auto& k : parsed.live.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
+        ids = std::move(parsed.live.ids);
+        imgs = std::move(parsed.live.imgs);
+        cvec = cv == 1;
+        file_bytes = size;
+        return true;
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while indexing " + path;
+        return false;
+    }
+}
+
 } // namespace strata::core
