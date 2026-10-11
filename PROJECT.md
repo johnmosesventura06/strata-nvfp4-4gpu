@@ -192,6 +192,11 @@ ai-host ~/strata-nvfp4/rollback-golden-20261010/RESTORE.sh (binary md5 6f5699966
   native_mmvq + argmax on each card, logits P2P straight into main's assembled buffer, host merge
   (max logit, tie -> lower global index = bitwise the full-head greedy pick). T==1 in-graph
   self-commit disabled under split (commits the MERGED pick via the host commit path).
+  RECORD CORRECTION 10-11 15:0x: the +8.2% single-stream figure was a morning-state reading;
+  an afternoon re-test of the same interleaved A/B gave engine-level -4/+3/+0.7% (pooled with
+  the morning: ~+2-4%, state-dependent; S never below W in any paired round). Exonerated:
+  journal (fresh-dir boot 96.5), cache slots (1520 in every boot), binary/config md5s, P2P
+  fallback. Adoption stands on bitwise exactness + quality gates + pooled +2-4%, not on +8.2%.
   Evidence: STRATA_DBG_SPLIT_VERIFY=2 in-boot harness bitwise-exact np1+np2 incl. 4 concurrent
   streams (0 mismatches, 2000+ rows witnessed); decode single-stream interleaved A/B +8.2% median
   (S 101.0/104.8/105.3 vs W 98.7/96.9/96.3); 2-stream aggregate neutral (S 105.7/105.0 vs

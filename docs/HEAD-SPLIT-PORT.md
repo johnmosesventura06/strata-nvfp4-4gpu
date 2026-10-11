@@ -338,3 +338,40 @@ graph-compatible, measured +3-5% there._
   (parts at frac 0.75 ≈ 169MB each — fits; frac higher or reserve tighter → re-check).
 - Owner directives in force: np2 is the production shape (design for it, test it); "if you hit the
   risk zone, find a way to fix it and make it work first before giving up"; adoption = his gate.
+
+## np4 exploration (10-11 13:4x-14:1x, owner-initiated; REVERTED to np2 production at 14:1x)
+
+Arm hs-np4-evict2 (parallel 4, --expert-cache 0 requested, --kv-resident 16384 per-slot pin):
+4 streams 27.7-29.1 t/s each = 110.8 aggregate (owner's 25/stream bar cleared); 2-stream 111.3
+(> np2 config's 105); 1-stream 96.1 (−6-8%); **pp 1139.5 = −37%**.
+CAUSE (arm B proven): not np4 — GPU0's resident expert cache. 4 slot states (4.98 GiB) evicted
+the cache 1520→668 slots (adaptive settle; --expert-cache 0 does NOT stick, the adaptive tier
+regrows into free VRAM). np2 shape with cache pinned 668 = pp 1173.6 (same drop); np2 with 1520
+= 1824-1875. Prefill expert work that hit GPU0 VRAM (grouped R4 compute) streams over PCIe when
+evicted — the streamed path costs ~37%, far more than raw byte math predicts (~3%), so the
+penalty is the path's compute shape, not its bandwidth. kv-resident pin is PER SLOT (32768×4
+does not boot at 512K; 16384×4 does).
+Ladder if np4 is ever wanted: (2) kv-resident 8192/slot → ~900 slots → pp ~1300-1500 unmeasured;
+(3) np4@384K/262K → slot states shrink → cache regrows; (4) two-config ladder with journal flip
+(0.6 s restore). Configs kept on ai-host: hs-np4-evict2.json, hs-armB-cache668.json; results
+/tmp/hs_np4b_results.txt, /tmp/hs_armB_results.txt.
+REVERTED: production np2 boot 14:1x (1520 slots, 2×1.39 GiB, parts ×3, probe exact).
+
+## RECORD CORRECTION (10-11 15:0x): the +8.2% was a morning-state reading
+
+Afternoon re-test (same interleaved design, same binary/config): engine-level deltas
+-4%/+3%/+0.7% (raw pairs 97.4/98.7, 96.2/99.1, 98.1/97.9 with accepts noted) vs morning
++8/+3/+5. Pooled across both sessions: **~+2-4%, state-dependent**. The adopted stack never
+read BELOW the winner in any paired round; W reproduces exactly across sessions (96.2-98.7)
+while S's absolute drifted (morning 101-105.3, afternoon 96.5-99.1).
+Exonerated confounds (measured): journal/parked sessions (fresh --conversation-cache-dir boot
+= 96.5, no better); expert cache size (1520 slots identical in every boot); VRAM/slot shape;
+binary (md5 ee752d3a unchanged since tag); config (md5-identical to banked copy); P2P fallback
+(no "fell back to mapped" in any scored boot). REMAINING open question (documented, unfixed):
+why S's absolute drifts by session while W does not — suspects left: unmeasured host/time-of-day
+interaction with the P2P/merge path, or the morning S boots benefiting from an unidentified
+transient. Next session's lever: same-day S-only repeatability series + STRATA_VERIFY_PROFILE
+stage stamps comparing morning/afternoon window internals.
+Adoption stands on: bitwise exactness (harness), quality gates, +2-4% pooled, zero paired-round
+regressions — NOT on +8.2%. README/PROJECT.md/writeup numbers corrected in the same pass
+(four-gpu frontpage commits).
