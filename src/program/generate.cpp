@@ -10088,13 +10088,14 @@ int main(int argc, char** argv) {
             // read image (admit-guarded), freed the moment the device transfer completes.
             if (!journal_index.empty()) {
                 const int64_t floor_tok = std::max<int64_t>({parked.tokens, resume, slot_tokens});
-                // the deepest prefix the prompt shares with any indexed file - through its live state OR any
-                // of its checkpoints (a fresh session shares only the header; the root checkpoint holds it)
-                auto depth_of = [&](const std::vector<int32_t>& v) -> int64_t {
-                    const int64_t L = std::min<int64_t>((int64_t) v.size(), n - 1);
-                    int64_t i2 = 0;
-                    for (; i2 < L; ++i2) if ((int32_t) ids[(size_t) i2] != v[(size_t) i2]) break;
-                    return i2;
+                // the file's checkpoints are the ONLY legal resume points (the restore looks for a checkpoint
+                // whose length EQUALS resume) - so candidates are the file's live length and each checkpoint
+                // length, each required to be a true prefix of this prompt, <= n-1, and >= the root floor:
+                // below that a fresh read beats transferring a whole snapshot
+                auto full_prefix = [&](const std::vector<int32_t>& v) -> bool {
+                    for (size_t i2 = 0; i2 < v.size(); ++i2)
+                        if ((int32_t) ids[i2] != v[i2]) return false;
+                    return true;
                 };
                 size_t bj = SIZE_MAX;
                 int64_t bj_depth = 0;
@@ -10102,13 +10103,11 @@ int main(int argc, char** argv) {
                     const auto& e = journal_index[j];
                     if (e.cvec != want_cvec) continue;
                     int64_t d = -1;
-                    if (req_imgs.empty() && e.imgs.empty()) {
-                        d = depth_of(e.ids);
-                        for (const auto& cv : e.cks) d = std::max(d, depth_of(cv));
-                    } else if ((int64_t) e.ids.size() <= n - 1 && imgs_below(req_imgs, (int64_t) e.ids.size()) == e.imgs) {
-                        d = depth_of(e.ids);   // image conversations: only the exact full-live prefix counts
-                    }
-                    if (d <= floor_tok || d > n - 1) continue;
+                    if (req_imgs.empty() && e.imgs.empty())
+                        for (const auto& cv : e.cks)   // checkpoints ONLY: resume must equal one of them exactly
+                            if ((int64_t) cv.size() > d && (int64_t) cv.size() <= n - 1 && full_prefix(cv))
+                                d = (int64_t) cv.size();
+                    if (d < 2048 || d <= floor_tok || d > n - 1) continue;
                     if (bj != SIZE_MAX && d <= bj_depth) continue;
                     bj = j;
                     bj_depth = d;
