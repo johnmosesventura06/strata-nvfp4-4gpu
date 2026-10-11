@@ -33,7 +33,7 @@
   "--kv",
   "int8",
   "--prefill",
-  "4096",
+  "6144",
   "--serve",
   "--mtp-q4",
   "head",
@@ -54,7 +54,7 @@
   "--peer-prefill-rows",
   "1536",
   "--conversation-cache-mib",
-  "16384",
+  "0",
   "--conversation-cache-dir",
   "journal"
  ],
