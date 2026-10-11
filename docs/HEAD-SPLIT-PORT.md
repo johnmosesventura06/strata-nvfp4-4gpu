@@ -416,3 +416,20 @@ rows per token adjacent) so the gather is one read per token instead of sixteen 
 the ~1.2 s serial first-chunk gather at EVERY prompt size (bench 3K → ~1600 pp, 16.7K → ~1950+,
 turn-tail TTFT up across the board). Touches tools/ple_bf16_pack.py layout + the engine's gather
 indexing + full re-verification battery.
+
+## 4096 chunk ADOPTED + peer-prefill confirmed (10-11 evening, owner GO)
+
+Production --prefill 6144 -> 4096 adopted (owner: "just keep 4096"): bench-3k500 shape reads
+1248-1439 pp / TTFT 2.14-2.47 s at 4096 (session-drift spread) vs 1024-1120 / 2.84 s at 6144 in
+the same evening's slow session; 16.7K pp costs -5-8% (1666-1758 vs 1824-1875). Backup
+.bak-20261011-pre-prefill4096; rollback kit ~/strata-nvfp4/rollback-20261011-evening/RESTORE.sh
+checkpoints the 4096 state (binary md5-verified against the tag, config snapshot, experiment
+configs quarantined, reboot + health verify).
+PEER TIER PREFILL A/B (bracketed, bench shape, 4096 chunk): on 1248/1439 vs off 1130 -> the tier
+pipeline contributes +10-27% even on single-chunk prompts; it stays on (it was never the stall).
+The GGUF-repo "per-piece xfer/xsum" port was evaluated and DROPPED: our per-group second-stream
+returns with double buffering are finer-grained, and incremental combine cannot move the
+per-layer stall point (combine waits the peer's last group of the layer either way).
+Remaining levers, ranked: PLE token-contiguous repack (the single-chunk TTFT floor, all sizes);
+session fast/slow investigation (contaminates every cross-boot A/B on this lane); tensor
+parallelism (the only all-GPU-trunk answer, ~3x ceiling, weeks-scale, absent from both repos).
