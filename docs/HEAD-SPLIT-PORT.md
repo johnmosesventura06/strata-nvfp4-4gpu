@@ -273,6 +273,18 @@ graph-compatible, measured +3-5% there._
   pp 1829.7 band, exact-string 6/6 repro, accept band), speed +8.2% median interleaved.
   ADOPTION = owner gate. Lane left running hs-np2-on (S) for the feel-test.
   Banked: tag + ~/strata-nvfp4/rollback-headsplit-20261011/ (see vault).
+- 2-STREAM VALIDATION (owner ask, 12:22-12:39): DBG level 2 under FOUR concurrent streams
+  (2 greedy + 2 sampling; batched np2 windows carrying both slots' rows): 0 mismatches,
+  2000+ rows witnessed, 0 fallbacks — bitwise exact in the production shape. Speed, 2 concurrent
+  × 1500 tok, interleaved: S 105.7/105.0 aggregate vs W 104.4/104.4 = **+0.6-1.2% ≈ neutral**
+  (both slots share one batched round: the head's 675MB read amortizes across slots and the round
+  is trunk-dominated, so the split's ~1.9ms/round saving dilutes). Single-stream keeps +8.2%.
+  No regression under concurrency.
+- **ADOPTED TO PRODUCTION (owner GO 12:2x, 10-11)**: configs/nvfp4-512k-np2-vision.json =
+  hs-np2-on (winner p3b-on base + native head + --head-split 0.7515), backup
+  .bak-20261011-pre-headsplit-adopt; production boot from the file; PROJECT.md entry; pushed to
+  github.com/johnmosesventura06/strata-nvfp4-4gpu (branch nvfp4-4gpu + tag
+  golden-20261011-headsplit-validated, owner GO).
 
 1. **P3 wiring — generate.cpp** (the ONLY missing code):
    - flag `--head-split FRAC` (float 0..0.99, 0=off default) beside --peer-prefill-rows parse

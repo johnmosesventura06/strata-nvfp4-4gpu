@@ -124,25 +124,7 @@ that). KV stays int8 (owner law: never bf16 on this lane, 4-bit banned).
   Off by default; np1 only for now (batch still refuses session files, engine + server).
 - Rollback of the whole arm: RESTORE.sh bank + git tags; durable-KV lift = 1 commit, re-adding the refusal is trivial.
 
-## NVMe durability tier for the conversation cache — SHIPPED (owner GO 10-10 10:12; commits 3-part, tag pending owner)
-
-Built exactly as designed below (it was right). Flags: --conversation-cache-dir DIR +
---conversation-cache-disk-mib N (default 102400). BATTERY, all on the live np2@512K+vision lane
-(test cfg nvfp4-512k-np2-journal.json, cap 3000 to exercise pruning):
-- park -> journal: 4 conversations written on switch, 226-405 ms each (0.4-0.7 GB files, 0600, dir 0700)
-- restart -> load: "5 conversation(s) restored into the RAM cache, 0 refused, 2.2 GiB read in 858 ms"
-- MOUNT AFTER RESTART (the golden-lane claim): first request continues conversation A ->
-  "17466 tokens = 17461 reused + 5 read in 109 ms", answer "PINEAPPLE-42." correct, wall 0.4-0.6 s
-  (vs 11-12 s cold). np2 throughout: no control lines touched.
-- LRU prune: two prune lines, journal held under the 3 GiB cap (2.9 GiB left), oldest deleted first
-- corruption: one flipped payload byte mid-file -> "refused ... payload checksum mismatch", the
-  other five restored, engine healthy. Dedup: loading A-t1 + A-t2 parks both, put()'s
-  drop_superseded collapses the chain (5 restored -> parked=4) - correct.
-ADOPTED 10-10 11:30 (owner GO): --conversation-cache-dir journal is in the production cfg (100 GiB
-default cap; test journal files wiped at cutover). Prod verification: boot restored 4/2.0 GiB/776 ms,
-first request after restart 17461/17466 reused, 0.6 s wall, correct answer. Tag journal-adopted-20261010.
-
-## Original design (10-10 04:19, kept for the record)
+## NVMe durability tier for the conversation cache — DESIGN (owner ask 10-10 04:19; GO pending)
 
 Golden-lane parity spec: ~100 GB on NVMe, oldest evicted, a session still inside it restores
 immediately after a restart instead of recomputing.
@@ -199,3 +181,23 @@ ai-host ~/strata-nvfp4/rollback-golden-20261010/RESTORE.sh (binary md5 6f5699966
   quality is the point; agentic feel-test = owner gate.
 - 128.8 GB table verified from setup.py NVFP4_REPOS (pinned revs + SHAs);
   dl_nvfp4.py imports the same table. Download starts on ready-to-run only.
+- 10-11 12:4x: HEAD-SPLIT ADOPTED TO PRODUCTION (owner GO). configs/nvfp4-512k-np2-vision.json
+  = p3b-on winner (bf16 PLE + CPU share + tier prefill rows 1536) + --native-head-gguf dense
+  + --head-split 0.7515 (three exact 62208-row parts on GPUs 1/2/3, main keeps rows [0,61696);
+  backup .bak-20261011-pre-headsplit-adopt). Binary = tag golden-20261011-headsplit-validated
+  (md5 ee752d3a07fb5476d0ae56820bdcbaff), banked ~/strata-nvfp4/rollback-headsplit-20261011/
+  with RESTORE.md; pre-split winner rollback untouched (rollback-p3b-winner-20261011/).
+  Mechanism: P2.5 GPU-side protocol - parts pre-launched at window start behind the engine's own
+  wait_flag_ge doorbell on a part-VRAM flag (main's in-graph bump = one-word P2P write), ranged
+  native_mmvq + argmax on each card, logits P2P straight into main's assembled buffer, host merge
+  (max logit, tie -> lower global index = bitwise the full-head greedy pick). T==1 in-graph
+  self-commit disabled under split (commits the MERGED pick via the host commit path).
+  Evidence: STRATA_DBG_SPLIT_VERIFY=2 in-boot harness bitwise-exact np1+np2 incl. 4 concurrent
+  streams (0 mismatches, 2000+ rows witnessed); decode single-stream interleaved A/B +8.2% median
+  (S 101.0/104.8/105.3 vs W 98.7/96.9/96.3); 2-stream aggregate neutral (S 105.7/105.0 vs
+  W 104.4/104.4); pp 1829.7 band unchanged; needle@40K verbatim; exact-string 6/6; accept 69-74%.
+  LAW: the engine is NOT boot-deterministic across boots (OFF-vs-OFF proven divergent) -
+  correctness gates must be in-boot (the DBG harness), never cross-boot byte-compare.
+  Full ledger: docs/HEAD-SPLIT-PORT.md. Design note: single-stream gains because the head's
+  675MB/round read was GPU0-serial; under 2-stream batching the read amortizes across slots and
+  the round is trunk-dominated, so the split's saving dilutes to ~+1% aggregate (no regression).
