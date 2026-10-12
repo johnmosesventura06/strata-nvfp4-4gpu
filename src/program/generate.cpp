@@ -7507,6 +7507,10 @@ int main(int argc, char** argv) {
             uint64_t bytes = 0;
         };
         std::vector<JournalEntry> journal_index;
+        // dedupe witness: the last state actually written to the journal (turn-end PARK and the next
+        // switch-park capture the same unchanged conversation; a second write is pure NVMe wear)
+        int64_t last_park_n = -1;
+        int32_t last_park_tail = -1;
         auto journal_prune = [&] {
             const uint64_t cap = (uint64_t) std::max<int64_t>(1024, o.conversation_cache_disk_mib) << 20;
             std::error_code ec;
@@ -7660,6 +7664,11 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if ((!conversations.enabled() && o.conversation_cache_dir.empty()) || !live_ok || live.empty()) return true;
+            if (!conversations.enabled() && (int64_t)live.size() == last_park_n
+                && (!live.empty() ? (int32_t)live.back() : -1) == last_park_tail) {
+                std::fprintf(stderr, "strata serve: conversation journal: skip duplicate park (%zu tokens unchanged)\n", live.size());
+                return true;
+            }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
@@ -7791,8 +7800,11 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
-                if (!o.conversation_cache_dir.empty())
+                if (!o.conversation_cache_dir.empty()) {
                     journal_write(image, snapshot_bytes);   // NVMe first: durable whatever the RAM cache decides
+                    last_park_n = (int64_t)live.size();
+                    last_park_tail = live.empty() ? -1 : (int32_t)live.back();
+                }
                 if (!conversations.enabled()) {
                     std::fprintf(stderr, "strata serve: conversation journal: disk-only park %zu tokens in %.1f ms (no RAM retention)\n",
                                  live.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -10116,6 +10128,7 @@ int main(int argc, char** argv) {
                     const int64_t dj_tokens = bj_depth;
                     const std::string dj_path = journal_index[bj].path;
                     journal_index.erase(journal_index.begin() + (long) bj);   // live here now; the next park re-files it deeper
+                    last_park_n = -1;   // the mounted state is not on this slot's journal witness
                     strata::core::SessionFileIdentity jid;
                     std::string je, jerr;
                     bool jready = false;
