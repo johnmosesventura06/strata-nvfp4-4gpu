@@ -53,13 +53,23 @@ freed right after the write (physical-RAM admit floor still guards it).
 
 ### Mount (request path, at `conversations.best`)
 1. RAM best match (existing) → `incoming` via `take()` (existing).
-2. Disk best match: longest `journal_index` entry whose ids prefix the prompt (imgs +
-   cvec gates identical to `best()`), deeper than the RAM match and than resume.
+2. Disk best match: deepest CHECKPOINT (live excluded) of any indexed file that is a
+   true prefix of the prompt, >= 2048 root floor, deeper than RAM/resume/slot matches;
+   imgs + cvec gates identical to `best()`. `resume` must equal a checkpoint length
+   EXACTLY (the restore looks it up by size; anything else fails and exits the engine).
    Full `session_file_read` (existing limits + RAM-admit floor) → validate → becomes
    `incoming`; index entry erased (file stays until pruned; the next park writes the
    longer conversation under a new hash name).
 3. Restore flows through the existing `incoming` path untouched (snapshot_restore,
    checkpoints, retain — retain no-ops when the RAM cache is disabled).
+4. **Self-healing re-pin (10-12, after the stale-root deadlock):** a disk mount sets
+   `journal_mounted`, which the root_at gate accepts in addition to cold reads. A
+   session mounting a SHALLOW stale root still computes its own prompt's root; if
+   deeper, the read checkpoints it and the next park carries the new root. Without
+   this, a mount is never `read_from == 0`, the root never re-pins, and every session
+   re-mounts + re-parks the stale shallow root forever (observed 10-12: unfolded-era
+   files pinned root@18432 → 7 s / 63% hit on every web session, surviving engine
+   restarts, until the journal was wiped).
 
 ### Boot
 `journal_load()` whenever dir is set (the "needs --conversation-cache-mib > 0" refusal

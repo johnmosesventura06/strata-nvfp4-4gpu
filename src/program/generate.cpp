@@ -10098,6 +10098,7 @@ int main(int argc, char** argv) {
             // disk-direct journal mount (docs/DISK-JOURNAL.md, owner 10-12): the deepest prefix the prompt shares
             // with an indexed NVMe file streams through the ordinary incoming path. RAM holds only the transient
             // read image (admit-guarded), freed the moment the device transfer completes.
+            bool journal_mounted = false;   // set by a successful disk mount below; read by the root_at gate
             if (!journal_index.empty()) {
                 const int64_t floor_tok = std::max<int64_t>({parked.tokens, resume, slot_tokens});
                 // the file's checkpoints are the ONLY legal resume points (the restore looks for a checkpoint
@@ -10155,6 +10156,7 @@ int main(int argc, char** argv) {
                         if (strata::core::session_file_read(dj_path, jid, img, jb, jerr, jlim)) {
                             incoming.emplace(std::move(img));
                             parked = {SIZE_MAX, dj_tokens, false};
+                            journal_mounted = true;   // era-transition guard: let this read re-pin a deeper root below
                             std::fprintf(stderr, "strata serve: conversation journal: mounted %lld tokens (%.1f GiB) from disk in %.0f ms\n",
                                          (long long) dj_tokens, (double) jb / (1u << 30),
                                          std::chrono::duration<double, std::milli>(Clock::now() - t0j).count());
@@ -10844,7 +10846,11 @@ int main(int argc, char** argv) {
             const int64_t last_turn = turn_at;   // ckpt=0 drops the split there, the root is still looked for before it
             if (!req_ckpt) turn_at = -1;
             int64_t root_at = -1;
-            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && (read_from == 0 || resumed_from0))
+            // journal_mounted: self-healing re-pin. A mount from a stale shallow root leaves read_from > 0, which
+            // used to suppress root computation forever - every session then re-mounted the stale root and
+            // re-parked it (the 10-12 deadlock). On a disk mount we still look for THIS prompt's root; if it is
+            // deeper than the mount point, the read below checkpoints it and the next park carries the new root.
+            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && (read_from == 0 || resumed_from0 || journal_mounted))
                 for (int64_t i = 1; i < last_turn; ++i)
                     if (ids[(size_t) i] == o.turn_token) {
                         if (i >= o.prompt_cache_root) root_at = i;
