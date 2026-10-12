@@ -489,3 +489,17 @@ dies on the geometry, read from include/strata/kernels/ngram.hpp at four-gpu tip
 Record kept per the calibration law: this doc named a days-scale "structural fix" that was
 impossible (geometry) and unnecessary (Direct I/O was already the live path). The survey that
 caught it cost one hour; shipping the doc's claim untested would have cost the port.
+
+## PLE gather baseline on the live lane + the row-cache knob tested flat (10-12, goal closure)
+
+STRATA_PLE_TRACE boot (journal build, direct mode): every prefill chunk logged
+"read started 0.1 ms into the run, layer 1 reached at 29.3, waited 0.0 ms" - the gather wait is
+ALREADY ZERO in Direct mode; the "1.2 s serial gather at 3K" inherited from the mmap-era comment is
+dead as a mechanism (the 3K TTFT gap is tier-sync/first-chunk compute, not PLE).
+--ple-row-cache 20,000,000 (20M bf16 rows = 6.4 GB eager heap, ple_reader RowCache::init):
+bench 3K pp 1471.5 / tg 104.5 / TTFT 2.09 vs same-day 1M-cache 1496.0 / 116.1 / 2.06; 57K probe pp
+1847.3 vs 1875.8; MemAvailable 19.0 vs 24.7. Flat-to-noise on every metric - a cache cannot win
+back a wait that is already zero. Reverted to the default 1M; the 20M arm lives on as
+configs/hs-rowcache20m.json if a future drive ever makes reads the bottleneck.
+Conclusion for the deep-session dip: gather-side is exonerated end to end; the 113->75 slide is
+accept-side (MTP draft acceptance on tool-heavy deep content); compaction remains the remedy.
