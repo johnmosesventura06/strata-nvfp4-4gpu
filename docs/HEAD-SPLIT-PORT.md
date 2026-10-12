@@ -463,3 +463,29 @@ owner GO (second time). PLE token-contiguous repack still the remaining single-c
 Aged bench after the table: pp 1515.5 / tg 108.0 / ttft 2.03; MemAvailable 25.6 GiB (no claim
 growth). vs the Reddit tester's C1 (997/81.5, 956/69.2, 902/69.7, 872/67.3 on Zen2+DDR4+PCIe4+fp8
 PLE): ~1.9x pp and flat vs his -12.5%/-17% decay.
+
+## RETRACTION: the "PLE token-contiguous repack" lever is impossible and was never needed (10-12, code survey)
+
+The lever named repeatedly above ("repack the PLE table token-contiguous: 16 page faults -> 1 read")
+dies on the geometry, read from include/strata/kernels/ngram.hpp at four-gpu tip:
+* the 16 rows per token are NOT 16 heads of one slot — they are (ngram_size-1) x heads_per_ngram =
+  2 x 8 = 16 INDEPENDENT hash lookups: bigram heads 0..7 and trigram heads 8..15, each hashed
+  (xor of multiply-mixed token ids) into its own ~20-million-slot prime vocabulary at its own
+  head_offset. 320,001,536 rows = 16 such regions. A token's 16 rows are unrelated slots in 16
+  regions; there is no per-token adjacency to pack. The faults are inherent to 16-way hashed n-gram
+  embeddings, not a layout mistake.
+* the premise that the gather suffers page-cache eviction is ALSO wrong for the live lane: the
+  engine's default `--ple-io` is DIRECT — unbuffered 4 KiB reads, batched with page dedupe + sort
+  across the whole prompt, 256-deep queue on an I/O worker, a bounded ~335 MB row cache, and the
+  table "never occupies RAM or the OS file cache". The boot log proves it (the keepalive line is
+  printed only in Direct mode). The "2.10-2.61 ms/token, sixteen SEPARATE page faults into a
+  26.8 GB mapping" comment measures the MMAP A/B arm on the IQ4-era table, not this path.
+* therefore the aged-decay A/B (claim 16G = 1135/86.8 vs claim 0 = 1543/105.5, same boot age) is
+  real but was mis-attributed: PLE pages were not the victim. Best remaining explanation is
+  reclaim/compaction/swap stalls on allocation paths under an unreclaimable 16 GiB shmem claim.
+  Not re-measured: the claim era is over — production runs mib 0, and the aged bench on the
+  journal build (14:50 boot, 81-conversation disk-direct journal) reads tg 113.3 after a full
+  depth table, so the decay is gone at the root either way.
+Record kept per the calibration law: this doc named a days-scale "structural fix" that was
+impossible (geometry) and unnecessary (Direct I/O was already the live path). The survey that
+caught it cost one hour; shipping the doc's claim untested would have cost the port.
