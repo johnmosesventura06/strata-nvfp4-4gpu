@@ -62,14 +62,14 @@ freed right after the write (physical-RAM admit floor still guards it).
    longer conversation under a new hash name).
 3. Restore flows through the existing `incoming` path untouched (snapshot_restore,
    checkpoints, retain — retain no-ops when the RAM cache is disabled).
-4. **Self-healing re-pin (10-12, after the stale-root deadlock):** a disk mount sets
-   `journal_mounted`, which the root_at gate accepts in addition to cold reads. A
-   session mounting a SHALLOW stale root still computes its own prompt's root; if
-   deeper, the read checkpoints it and the next park carries the new root. Without
-   this, a mount is never `read_from == 0`, the root never re-pins, and every session
-   re-mounts + re-parks the stale shallow root forever (observed 10-12: unfolded-era
-   files pinned root@18432 → 7 s / 63% hit on every web session, surviving engine
-   restarts, until the journal was wiped).
+4. **Self-healing re-pin (10-14 v2; the mount-only version of 10-12 was too
+   narrow):** `root_at` is computed on EVERY read, from any resume source: cold,
+   slot lineage, parked, or disk mount. The cuts loop ignores anything <= read_from,
+   so healthy sessions pay nothing extra. A read that resumes from a checkpoint
+   shallower than its own prompt's first separator checkpoints the true root and
+   the next resume/mount goes deep. This kills the stale-root deadlock (root@18432
+   surviving three boots and a restart) without journal wipes: verified with stale
+   files deliberately left in place, mounted deep, 120 tokens re-read, 0.54 s.
 
 ### Boot
 `journal_load()` whenever dir is set (the "needs --conversation-cache-mib > 0" refusal
