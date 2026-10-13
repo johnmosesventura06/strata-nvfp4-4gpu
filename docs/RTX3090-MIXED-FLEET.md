@@ -44,7 +44,14 @@ lines say `compact group buffers` and NOT `no P2P: through mapped host`.
 the kernel module. The `fd-import` route (`cuMemCreate`/export/import) was probed as an
 alternative and FAULTS cross-generation — do not pursue it; the libcuda patch is the path.
 
-## 3. Slot-proof enumeration (config side)
+## 3. Enumeration: position-based trunk (current) + UUID pinning (option)
+
+**STATUS 10-13 (owner call): the UUID pin was REMOVED from production.** Policy is simply
+`PCI_BUS_ID` order - **whatever sits in the x8 slot at 01:00 is device 0, the trunk** - 3090 or
+5060 Ti, no config change needed when cards are swapped. The fat binary makes any seat any card.
+The UUID mechanism stays documented here because it is the escape hatch when a card physically
+sits OUTSIDE PCI order (e.g. the 3090 on the x4 riser at 0D:00 forced to trunk anyway - the
+measured x4-trunk collapse, 777 pp, is why that arrangement was abandoned):
 
 Production pins CUDA's device order by **UUID**, not by position:
 
