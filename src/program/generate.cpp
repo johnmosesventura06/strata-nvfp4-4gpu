@@ -7508,9 +7508,12 @@ int main(int argc, char** argv) {
         };
         std::vector<JournalEntry> journal_index;
         // dedupe witness: the last state actually written to the journal (turn-end PARK and the next
-        // switch-park capture the same unchanged conversation; a second write is pure NVMe wear)
+        // switch-park capture the same unchanged conversation; a second write is pure NVMe wear).
+        // 10-15 audit: the witness is a CONTENT hash (FNV-1a over the live ids, same scheme as the file
+        // name), NOT (size, tail) - size+tail collided across different conversations that ended at the
+        // same length (tail is im_end almost universally), silently skipping the second park.
         int64_t last_park_n = -1;
-        int32_t last_park_tail = -1;
+        uint64_t last_park_hash = 0;
         auto journal_prune = [&] {
             const uint64_t cap = (uint64_t) std::max<int64_t>(1024, o.conversation_cache_disk_mib) << 20;
             std::error_code ec;
@@ -7537,13 +7540,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: conversation journal: pruned to the cap, %zu file(s) deleted, %.1f GiB left\n",
                          journal_pruned, (double) total / (1u << 30));
         };
-        auto journal_write = [&](const strata::core::SavedConversation& image, size_t snapshot_bytes) {
+        auto journal_write = [&](const strata::core::SavedConversation& image, size_t snapshot_bytes) -> bool {
             (void) snapshot_bytes;
             strata::core::SessionFileIdentity jid;
             std::string e;
             if (!session_identity(jid, e, [] {})) {
                 std::fprintf(stderr, "strata serve: conversation journal: no identity (%s); skipped\n", e.c_str());
-                return;
+                return false;
             }
             uint64_t h = 1469598103934665603ULL;      // FNV-1a over the fingerprints and the parked prefix's ids
             auto mix = [&h](uint64_t v) { for (int b = 0; b < 8; ++b) { h ^= (v >> (b * 8)) & 0xFF; h *= 1099511628211ULL; } };
@@ -7560,7 +7563,7 @@ int main(int argc, char** argv) {
             const auto t0j = Clock::now();
             if (!strata::core::session_file_write(path, image, jid, written, jerr, wo)) {
                 std::fprintf(stderr, "strata serve: conversation journal: write failed (%s); RAM park unaffected\n", jerr.c_str());
-                return;
+                return false;
             }
             std::fprintf(stderr, "strata serve: conversation journal: wrote %zu tokens, %.1f GiB in %.0f ms\n",
                          (size_t) image.live.ids.size(), (double) written / (1u << 30),
@@ -7583,6 +7586,7 @@ int main(int argc, char** argv) {
                 journal_index.push_back(std::move(ne));
             }
             journal_prune();
+            return true;
         };
         auto journal_load = [&] {
             std::error_code ec;
@@ -7664,9 +7668,16 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if ((!conversations.enabled() && o.conversation_cache_dir.empty()) || !live_ok || live.empty()) return true;
-            if (!conversations.enabled() && (int64_t)live.size() == last_park_n
-                && (!live.empty() ? (int32_t)live.back() : -1) == last_park_tail) {
-                std::fprintf(stderr, "strata serve: conversation journal: skip duplicate park (%zu tokens unchanged)\n", live.size());
+            // content witness (10-15 audit): equal hash <=> equal live ids <=> the journal already holds
+            // this exact state under its content-hashed name; anything else parks. (~1 ms at 77 K tokens -
+            // noise next to the 300-700 ms write it may skip.)
+            uint64_t park_hash = 1469598103934665603ULL;
+            for (const int32_t id : live) {
+                const uint64_t v = (uint64_t) (uint32_t) id;
+                for (int b = 0; b < 8; ++b) { park_hash ^= (v >> (b * 8)) & 0xFF; park_hash *= 1099511628211ULL; }
+            }
+            if (!conversations.enabled() && (int64_t)live.size() == last_park_n && park_hash == last_park_hash) {
+                std::fprintf(stderr, "strata serve: conversation journal: skip duplicate park (%zu tokens, identical content)\n", live.size());
                 return true;
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
@@ -7801,9 +7812,10 @@ int main(int argc, char** argv) {
                 }
                 const size_t snapshot_bytes = image.bytes();
                 if (!o.conversation_cache_dir.empty()) {
-                    journal_write(image, snapshot_bytes);   // NVMe first: durable whatever the RAM cache decides
-                    last_park_n = (int64_t)live.size();
-                    last_park_tail = live.empty() ? -1 : (int32_t)live.back();
+                    if (journal_write(image, snapshot_bytes)) {   // NVMe first: durable whatever the RAM cache decides
+                        last_park_n = (int64_t) live.size();
+                        last_park_hash = park_hash;
+                    }   // a FAILED write arms no witness - the next park retries (silent-loss fix, 10-15 audit)
                 }
                 if (!conversations.enabled()) {
                     std::fprintf(stderr, "strata serve: conversation journal: disk-only park %zu tokens in %.1f ms (no RAM retention)\n",
@@ -10133,6 +10145,7 @@ int main(int argc, char** argv) {
                     // the entry is erased only AFTER a successful read (a refused mount must not
                     // orphan the file: the next request - or this one's successor - can still mount it)
                     last_park_n = -1;   // the mounted state is not on this slot's journal witness
+                    last_park_hash = 0;
                     strata::core::SessionFileIdentity jid;
                     std::string je, jerr;
                     bool jready = false;
