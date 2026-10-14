@@ -58,7 +58,7 @@
   "--conversation-cache-dir",
   "journal",
   "--ple-row-cache",
-  "20000000"
+  "10000000"
  ],
  "sampling": {
   "temperature": 1.0,
