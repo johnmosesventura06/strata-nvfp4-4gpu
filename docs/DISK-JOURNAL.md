@@ -58,8 +58,9 @@ freed right after the write (physical-RAM admit floor still guards it).
    imgs + cvec gates identical to `best()`. `resume` must equal a checkpoint length
    EXACTLY (the restore looks it up by size; anything else fails and exits the engine).
    Full `session_file_read` (existing limits + RAM-admit floor) → validate → becomes
-   `incoming`; index entry erased (file stays until pruned; the next park writes the
-   longer conversation under a new hash name).
+   `incoming`; index entry erased ONLY after the read succeeds (10-14: a refused
+   mount keeps its entry - the file stays mountable for the next request; the next
+   park re-files the longer conversation under a new hash name).
 3. Restore flows through the existing `incoming` path untouched (snapshot_restore,
    checkpoints, retain — retain no-ops when the RAM cache is disabled).
 4. **Self-healing re-pin (10-14 v2; the mount-only version of 10-12 was too
