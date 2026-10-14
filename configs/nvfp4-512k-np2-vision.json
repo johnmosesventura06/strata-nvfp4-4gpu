@@ -76,7 +76,7 @@
  },
  "host": "100.71.205.101",
  "port": 8190,
- "parallel": 2,
+ "parallel": 3,
  "vision": {
   "exe": "build-vision-cpu/bin/strata-vision",
   "mmproj": "../models/original-tables/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
