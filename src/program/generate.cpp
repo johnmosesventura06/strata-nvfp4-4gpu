@@ -10104,21 +10104,24 @@ int main(int argc, char** argv) {
                 // whose length EQUALS resume) - so candidates are the file's live length and each checkpoint
                 // length, each required to be a true prefix of this prompt, <= n-1, and >= the root floor:
                 // below that a fresh read beats transferring a whole snapshot
-                auto full_prefix = [&](const std::vector<int32_t>& v) -> bool {
-                    for (size_t i2 = 0; i2 < v.size(); ++i2)
-                        if ((int32_t) ids[i2] != v[i2]) return false;
-                    return true;
-                };
+                // the engine's own starts_with(pre, pre_imgs) is the prefix contract (ids + images)
                 size_t bj = SIZE_MAX;
                 int64_t bj_depth = 0;
+                // image-bearing conversations mount too (owner 10-14: the no-images gate made every
+                // screenshot-carrying session unmountable - swapping back to it re-paid the whole
+                // prompt). The engine's own prefix test is the contract: ids match AND the image keys
+                // below the candidate depth match; the file's live image list filtered to the
+                // checkpoint length IS that checkpoint's image list (positions are stable in the
+                // shared prefix space).
                 for (size_t j = 0; j < journal_index.size(); ++j) {
                     const auto& e = journal_index[j];
                     if (e.cvec != want_cvec) continue;
                     int64_t d = -1;
-                    if (req_imgs.empty() && e.imgs.empty())
-                        for (const auto& cv : e.cks)   // checkpoints ONLY: resume must equal one of them exactly
-                            if ((int64_t) cv.size() > d && (int64_t) cv.size() <= n - 1 && full_prefix(cv))
-                                d = (int64_t) cv.size();
+                    for (const auto& cv : e.cks)   // checkpoints ONLY: resume must equal one of them exactly
+                        {
+                        const int64_t L = (int64_t) cv.size();
+                        if (L > d && L <= n - 1 && starts_with(cv, imgs_below(e.imgs, L))) d = L;
+                        }
                     if (d < 2048 || d <= floor_tok || d > n - 1) continue;
                     if (bj != SIZE_MAX && d <= bj_depth) continue;
                     bj = j;
@@ -10127,7 +10130,8 @@ int main(int argc, char** argv) {
                 if (bj != SIZE_MAX) {
                     const int64_t dj_tokens = bj_depth;
                     const std::string dj_path = journal_index[bj].path;
-                    journal_index.erase(journal_index.begin() + (long) bj);   // live here now; the next park re-files it deeper
+                    // the entry is erased only AFTER a successful read (a refused mount must not
+                    // orphan the file: the next request - or this one's successor - can still mount it)
                     last_park_n = -1;   // the mounted state is not on this slot's journal witness
                     strata::core::SessionFileIdentity jid;
                     std::string je, jerr;
@@ -10155,6 +10159,11 @@ int main(int argc, char** argv) {
                         if (strata::core::session_file_read(dj_path, jid, img, jb, jerr, jlim)) {
                             incoming.emplace(std::move(img));
                             parked = {SIZE_MAX, dj_tokens, false};
+                            for (size_t j = 0; j < journal_index.size(); ++j)
+                                if (journal_index[j].path == dj_path) {
+                                    journal_index.erase(journal_index.begin() + (long) j);   // live in the slot now; the next park re-files
+                                    break;
+                                }
                             std::fprintf(stderr, "strata serve: conversation journal: mounted %lld tokens (%.1f GiB) from disk in %.0f ms\n",
                                          (long long) dj_tokens, (double) jb / (1u << 30),
                                          std::chrono::duration<double, std::milli>(Clock::now() - t0j).count());
