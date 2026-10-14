@@ -30,7 +30,13 @@ driver 615.71.09 with the consumer-P2P patch, CUDA 13.3, Linux).
 | rig | prefill tok/s | decode tok/s | notes |
 |---|---|---|---|
 | 4× 5060 Ti 16 GB | 1,846-1,891 @14.5-54K prompt, 1,723-1,739 @195-212K | 94-113 | flat depth curve 14K→212K |
-| 3090 trunk + 3× 5060 Ti | ~1,290-1,300 @3K, ~1,704 @57K | **131-145** | trunk must sit on x8; peers fine on x4 |
+| 3090 trunk + 3× 5060 Ti (np3) | ~1,250-1,300 @3K, ~1,670 @57K | **132 solo** | trunk must sit on x8; peers fine on x4 |
+
+Concurrency on the np3 shape: 2 streams ~56-79 t/s each (~135 aggregate), 3 streams ~36-58 each (~139 aggregate).
+The aggregate ceiling is the 3090 trunk and it is already saturated at two streams, so the third slot is nearly
+free; its cost is expert cache (4,632 → ~3,150 slots, fleet residency 85.6% → ~80%). For comparison, the vLLM
+golden lane on the same rig runs ~40 t/s per stream at two concurrent requests — strata's fan-out scales
+concurrency better at low stream counts; TP scales prefill better.
 
 Decode is trunk-bound: the aggregate ceiling (~105-110 t/s across concurrent streams on all-Blackwell) rises
 only with a faster trunk card — which is why the 3090-as-trunk shape posts the best single-stream numbers.
@@ -53,7 +59,7 @@ NVFP4 (`qwen-nvidia-nvfp4`) is the alternative if you prefer their quantizer.
   615.71.09 with the consumer-P2P kernel patch), CUDA 13.3, Linux. Without the P2P patch everything still
   runs over host-mapped transport — correct, slower.
 - **Context by shape (this fork, multi-GPU):** `nvfp4-512k-np2-vision` = 524,288 tokens (YaRN) with vision
-  across np2; `np4-262k` = 262,144 across np4. These are fleet numbers — upstream's single-card table
+  across **np3** (3 concurrent slots; the filename predates the np3 adoption); `np4-262k` = 262,144 across np4. These are fleet numbers — upstream's single-card table
   (65,536 @16 GB) does not apply to a 4-card tier.
 - **CPU:** x86-64 with AVX2 minimum; AVX-512 (Zen 4/5) unlocks the full CPU prefill share (measured +44% at
   fixed chunk); weaker CPUs' share auto-backs off.
@@ -69,7 +75,7 @@ START-HERE.bat        (Linux: ./setup.sh)
 ```
 
 Setup checks the PC, installs the engine and the model pack, and starts the server on `http://127.0.0.1:8080`.
-For the multi-GPU fleet shapes, boot with `configs/nvfp4-512k-np2-vision.json` (production: np2, 512K context,
+For the multi-GPU fleet shapes, boot with `configs/nvfp4-512k-np2-vision.json` (production: np3, 512K context,
 head split 0.7515, tier prefill, disk journal, `--conversation-cache-mib 0`) or `configs/np4-262k.json`
 (np4 concurrency shape at 262K). Every engine env flag is documented in [.env.example](.env.example).
 Multi-GPU P2P needs the consumer-P2P kernel patch; without it the engine still runs, falling back to
