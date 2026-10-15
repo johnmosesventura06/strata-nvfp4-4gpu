@@ -233,19 +233,28 @@ template <int B>
 void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
     constexpr int RPB = 4;
+    // The transposed reduction (STRATA_TSUM=1) folds RPB * NT values per block through a butterfly whose width
+    // STOPS at 32 (s26_tsum.cuh's pow2_ceil saturates), so with a 12-row instantiation the product is 48 and
+    // entries 32..47 would simply never be stored -- not only at 12 rows: at EVERY window from 5 rows up, which
+    // is why this is computed rather than commented. Past 8 rows the staged variant therefore takes half the
+    // rows per block (2 x 12 = 24, inside the butterfly) and twice the blocks; the plain arms keep RPB.
+    constexpr int RPB_TS = RPB * strata::kernels::kVerifyMaxT <= 32 ? RPB : 2;
+    static_assert(RPB_TS * strata::kernels::kVerifyMaxT <= 32,
+                  "the transposed reduction carries 32 values per block: a wider window needs a two-level tsum");
     const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
+    const unsigned nb_ts = (unsigned) ((n_out + RPB_TS - 1) / RPB_TS);
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
     if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
-#define S26_AUX(TSV) \
-        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, TSV, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); \
-        else bf16_f32_mmvf_rows_kernel<B, strata::kernels::kVerifyMaxT, RPB, TSV, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux);
-        if (ts) { S26_AUX(true) } else { S26_AUX(false) }
+#define S26_AUX(TSV, RB, NBL) \
+        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RB, TSV, true><<<NBL + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); \
+        else bf16_f32_mmvf_rows_kernel<B, strata::kernels::kVerifyMaxT, RB, TSV, true><<<NBL + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux);
+        if (ts) { S26_AUX(true, RPB_TS, nb_ts) } else { S26_AUX(false, RPB, nb) }
 #undef S26_AUX
         return;
     }
     if (ts) {
-        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
-        else bf16_f32_mmvf_rows_kernel<B, strata::kernels::kVerifyMaxT, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB_TS, true><<<nb_ts, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+        else bf16_f32_mmvf_rows_kernel<B, strata::kernels::kVerifyMaxT, RPB_TS, true><<<nb_ts, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
         return;
     }
     if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);

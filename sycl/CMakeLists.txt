@@ -27,6 +27,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+# The 12-row verify window is CUDA/HIP for now: this backend's bf16 mirror still tops out at 8 rows.
+# Pin the ceiling the shared header reads, so a SYCL build keeps the window it can prove instead of one it
+# would silently truncate (include/strata/kernels/verify_kernels.hpp).
+add_compile_definitions(STRATA_SYCL_BUILD)
 
 set(STRATA_SYCL_AOT "" CACHE STRING "AOT device for the GPU code, e.g. bmg-g31 (empty: SPIR-V, JIT at run time)")
 # The device spins on host flags are bounded (include/strata/sycl_doorbell.hpp). The bound is chosen per device at run

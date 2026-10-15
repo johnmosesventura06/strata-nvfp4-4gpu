@@ -25,10 +25,22 @@ namespace strata::kernels {
 // 12 is the largest this can be: expert_source's kMaxWindowEntries and verify_kernels' kResidentPlanMax
 // are 128 per-layer entries = 12 tokens x top-10, so 13 will not compile.  It travels with cpu::MAXT
 // (the pool's tables), s2_expert_grouped's GMAX, native_mmvq's MAX_NCOLS and fused_gr's kFusedGrMaxT --
-// each of those is an ARRAY bound or a capacity clamp, and each of their kernels keeps every token's
-// arithmetic independent of how many tokens ride along (that is what the *_parity harnesses prove, and
-// they now loop to this constant rather than to a literal 8).
+// each of those is an ARRAY bound or a capacity clamp, and each kernel keeps a token's arithmetic
+// independent of how many tokens ride along.  THAT is the thing to prove when touching this number, not
+// to assume: several *_parity harnesses used to loop `T = 1..8` as a LITERAL, which silently stops
+// proving anything the moment the constant moves, and the bf16 rows/TS arms had no row-count harness at
+// all.  When you raise this, grep the harnesses for literals 8 and widen them, then run the whole set on
+// every architecture the machine has (here sm_86 and sm_120: the caps that bind are per-block shared
+// memory and the 32-value butterfly in s26_tsum, and both differ by device).
+//
+// The SYCL mirror (sycl/) still computes at most 8 rows in native_bf16.dp.cpp's NT ladder and cannot be
+// built or witnessed from this tree, so that backend pins its own ceiling below rather than accept a
+// window it would silently truncate.  Raising it is a SYCL change, with SYCL's build and parity runs.
+#if defined(STRATA_SYCL_BUILD)
+inline constexpr int kVerifyMaxT = 8;
+#else
 inline constexpr int kVerifyMaxT = 12;
+#endif
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise
