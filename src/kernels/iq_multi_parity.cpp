@@ -4,7 +4,7 @@
 //     build/iq_multi_parity            the checks (a ctest; needs the GPU)
 //     build/iq_multi_parity --bench    the checks, then old/new timings of both paths
 //
-// (1) iq_mmvq, every format it takes, ncols 1..8 and 11 (the > 8 split): the new output must be BITWISE equal to
+// (1) iq_mmvq, every format it takes, ncols 1..kVerifyMaxT and one past it (the > kVerifyMaxT split): the new output must be BITWISE equal to
 //     the old one (iq_set_old_kernels), and within float rounding of a double reference built from the GPU's own
 //     dequantizer (validated against gguf-py by iq_parity) and the dequantized q8_1 activations - a gross-error
 //     guard, not the contract.
@@ -17,6 +17,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -116,7 +117,7 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
     k::iq_dequant_f32(t, dw, (int64_t) n_out * n_in, dwf, s);
     std::vector<float> wf((size_t) n_out * n_in);
     ck(cudaMemcpy(wf.data(), dwf, wf.size() * 4, cudaMemcpyDeviceToHost), "wf");
-    const int max_cols = 11;
+    const int max_cols = k::kVerifyMaxT + 3;   // the > kVerifyMaxT split, the same + 3 as 11 when the window had 8 rows
     const auto x = random_x((size_t) max_cols * n_in, rng);
     float* dx = dalloc<float>(x.size());
     ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
@@ -129,7 +130,9 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
     float* dy_old = dalloc<float>((size_t) max_cols * n_out);
     float* dy_new = dalloc<float>((size_t) max_cols * n_out);
     std::vector<float> y_old((size_t) max_cols * n_out), y_new(y_old.size());
-    const int cols[] = {1, 2, 3, 4, 5, 6, 7, 8, 11};
+    std::vector<int> cols;
+    for (int c = 1; c <= k::kVerifyMaxT; ++c) cols.push_back(c);
+    cols.push_back(max_cols);   // the > kVerifyMaxT split
     int bad = 0;
     double worst = 0.0;
     for (int nc : cols) {
@@ -251,7 +254,7 @@ struct Grouped {
 
 void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     // 0..11 entries per group: one pass, a partial pass, two passes and three passes of GRP_NC = 4
-    Grouped G(gu, dt, H, FF, {1, 3, 4, 5, 0, 8, 2, 11, 1}, 8, rng);
+    Grouped G(gu, dt, H, FF, {1, 3, 4, 5, 0, 8, 2, 11, 1}, k::kVerifyMaxT, rng);
     const auto a = G.result(true, s), b = G.result(false, s);
     size_t diff = 0, written = 0;
     bool finite = true;
@@ -293,14 +296,14 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         const auto w = random_rows(t, n_out, n_in, rng);
         uint8_t* dw = dalloc<uint8_t>(w.size());
         ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
-        const auto x = random_x((size_t) 8 * n_in, rng);
+        const auto x = random_x((size_t) k::kVerifyMaxT * n_in, rng);
         float* dx = dalloc<float>(x.size());
         ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
-        uint8_t* dxq = dalloc<uint8_t>((size_t) 8 * (n_in / 32) * 36);
-        k::quantize_q8_1_rows(dx, 8, n_in, dxq, s);
-        float* dy = dalloc<float>((size_t) 8 * n_out);
+        uint8_t* dxq = dalloc<uint8_t>((size_t) k::kVerifyMaxT * (n_in / 32) * 36);
+        k::quantize_q8_1_rows(dx, k::kVerifyMaxT, n_in, dxq, s);
+        float* dy = dalloc<float>((size_t) k::kVerifyMaxT * n_out);
         std::printf("%-8s iq_mmvq %d x %d:", name_of(t), n_out, n_in);
-        for (int nc = 1; nc <= 8; ++nc) {
+        for (int nc = 1; nc <= k::kVerifyMaxT; ++nc) {
             float us[2];
             for (int old = 1; old >= 0; --old) {
                 k::iq_set_old_kernels(old != 0);
@@ -316,7 +319,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     for (int gu : {16, 17, 18, 21, 22, 29}) {
         std::printf("%-8s/Q2_0 grouped, 16 groups of m entries:", name_of(gu));
         for (int m : {1, 2, 3, 4, 8}) {
-            Grouped G(gu, 42, 2560, 640, std::vector<int>(16, m), 8, rng);
+            Grouped G(gu, 42, 2560, 640, std::vector<int>(16, m), k::kVerifyMaxT, rng);
             float us[2];
             for (int old = 1; old >= 0; --old)
                 us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });

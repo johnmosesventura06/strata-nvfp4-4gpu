@@ -1,7 +1,7 @@
 // src/kernels/spec_verify_parity.cpp - the GPU verifier of probabilistic draft acceptance (sample_tokens_spec) against
 // the host reference (include/strata/core/spec_prob.hpp), token for token.
 //
-// Random logits at three vocabulary sizes (one block, a few blocks, the engine's 248,320), windows of 2..8 rows,
+// Random logits at three vocabulary sizes (one block, a few blocks, the engine's 248,320), windows of 2..kVerifyMaxT rows,
 // chains with top_k / top_p / min_p / temperature and repetition penalties over a per-row history, drafts taken from
 // the row's own top tokens, outside them, and from q; q lists cut by a DIFFERENT chain than p's; n_q from 0 (every
 // row a point mass) to all rows.  The host computes p the sampler's way (penalties on the raw logits, top_k with
@@ -10,6 +10,7 @@
 // spec_sample.  Every out[t] must match, accepted or not.  Needs a GPU.
 #include "strata/core/spec_prob.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -124,8 +125,8 @@ int main(int argc, char** argv) {
     std::mt19937_64 g(777);
     long long rows = 0, accepted = 0, rejected = 0, plain = 0, bad = 0, qrows_total = 0;
     const int vocabs[] = {1000, 50000, 248320};
-    const int Ts[] = {2, 3, 5, 8};
-    const int kMaxT = 8;
+    const int Ts[] = {2, 3, 5, strata::kernels::kVerifyMaxT};
+    const int kMaxT = strata::kernels::kVerifyMaxT;
     float* d_logits = nullptr;
     int* d_out = nullptr;
     int32_t* d_hist = nullptr;

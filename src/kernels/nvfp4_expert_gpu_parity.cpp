@@ -3,9 +3,10 @@
 //
 //     nvfp4_expert_gpu_parity pack/experts.bin [layer expert ...]
 //
-// Eight tokens of N(0,1) activations through one expert: q8_1 input, gate/up with s_gate / s_up, SwiGLU, q8_1 of the
-// hidden, down with s_down on its output. Only the two activation roundings separate it from the reference (~1%).
+// Up to kVerifyMaxT tokens of N(0,1) activations through one expert: q8_1 input, gate/up with s_gate / s_up, SwiGLU,
+// q8_1 of the hidden, down with s_down on its output. Only the two activation roundings separate it from the reference (~1%).
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "ggml.h"
 
@@ -30,7 +31,7 @@ void ck(cudaError_t e, const char* what) {
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: nvfp4_expert_gpu_parity pack/experts.bin [layer expert ...]\n"); return 2; }
     constexpr int64_t N = 2560, FF = 640;
-    constexpr int T = 8;
+    constexpr int T = k::kVerifyMaxT;
     const k::NativeExpertLayout L = k::native_expert_layout(40, 40, N, FF);
     const size_t layer_bytes = 512 * L.bytes;          // L.bytes counts the 16-byte tail
     std::vector<int> picks;
@@ -81,7 +82,9 @@ int main(int argc, char** argv) {
         ck(cudaMalloc(&dout, (size_t) T * N * 4), "out");
         ck(cudaMalloc(&scr, k::native_expert_scratch_bytes(T, FF)), "scratch");
         const unsigned long long ptr = (unsigned long long) db;
-        const int32_t start[2] = {0, T}, ng = 1, ids[T] = {0, 1, 2, 3, 4, 5, 6, 7};
+        const int32_t start[2] = {0, T}, ng = 1;
+        int32_t ids[T];                                          // token ids 0..T-1, sized by the window's rows
+        for (int i = 0; i < T; ++i) ids[i] = i;
         ck(cudaMalloc(&dptr, 8), "p"); ck(cudaMemcpy(dptr, &ptr, 8, cudaMemcpyHostToDevice), "p");
         ck(cudaMalloc(&dstart, 8), "s"); ck(cudaMemcpy(dstart, start, 8, cudaMemcpyHostToDevice), "s");
         ck(cudaMalloc(&dng, 4), "n"); ck(cudaMemcpy(dng, &ng, 4, cudaMemcpyHostToDevice), "n");

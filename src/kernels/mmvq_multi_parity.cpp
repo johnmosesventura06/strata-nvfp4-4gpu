@@ -30,6 +30,7 @@
 // blocks of 256) each thread holds at most one block in both layouts and they coincide; its case uses n_in = 4096.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -72,7 +73,12 @@ uint16_t sane_half(std::mt19937& rng) {
 }
 
 // T = 4 is the last width where the two layouts coincide, T = 5 the first where they differ
-const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 7, 8};   // every width up to MAX_NCOLS (7 was missing)
+// every width up to the window's rows: the vector is BUILT from kVerifyMaxT, so a raise of the constant covers it
+const std::vector<int> WIDTHS = [] {
+    std::vector<int> w;
+    for (int t = 1; t <= strata::kernels::kVerifyMaxT; ++t) w.push_back(t);
+    return w;
+}();
 constexpr int COINCIDE_MAX_T = 4;
 
 bool ck(cudaError_t e, const char* what) {

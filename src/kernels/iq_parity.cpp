@@ -10,10 +10,11 @@
 // What is compared, and how: the dequant parity is a MEASURED relative error (sum|got-ref| / sum|ref|) -
 // bitwise equality is not claimed and not required; on the generated fixtures it measures 0.00e+00.  The
 // MMVQ dot (q8_1 activations) must match the float matrix-vector product over that reference within the
-// activation rounding (a few 1e-3 relative), for 1 to 8 columns, every column of a multi-column call bitwise
+// activation rounding (a few 1e-3 relative), for 1 to kVerifyMaxT columns, every column of a multi-column call bitwise
 // equal to a one-column call on it.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -66,9 +67,9 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < ref.size(); ++i) { num += std::fabs(got[i] - ref[i]); den += std::fabs(ref[i]); }
             dq_err = num / (den + 1e-30);
         }
-        // the dot, ncols 1..8: each column of an ncols call bitwise equal to a one-column call on it (the
+        // the dot, ncols 1..kVerifyMaxT: each column of an ncols call bitwise equal to a one-column call on it (the
         // exact multi-column layout, the default), all of them within the activation rounding of the float product
-        const int MC = 8;
+        const int MC = strata::kernels::kVerifyMaxT;
         std::mt19937 rng(7);
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) MC * cols);

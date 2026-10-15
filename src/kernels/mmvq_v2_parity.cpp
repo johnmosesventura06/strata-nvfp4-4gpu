@@ -16,6 +16,7 @@
 // the time is the kernel's and not the launch's.  Medians of alternating replays.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -210,20 +211,20 @@ int main(int argc, char** argv) {
     if (!strata::kernels::native_mmvq_multi_exact()) { std::printf("the multi-column layout is not EXACT\n"); return 2; }
     int fails = 0, checks = 0;
     for (const Mat& m : MATS)
-        for (int T = 1; T <= 8; ++T) {
+        for (int T = 1; T <= strata::kernels::kVerifyMaxT; ++T) {
             if (m.n_out > 100000 && T != 1 && T != 4 && T != 5) continue;   // the head: fewer widths (memory, time)
             fails += bits_single(m, T, s);
             ++checks;
         }
     for (const Group& g : GROUPS)
-        for (int T = 1; T <= 8; ++T) { fails += bits_group(g, T, s); ++checks; }
+        for (int T = 1; T <= strata::kernels::kVerifyMaxT; ++T) { fails += bits_group(g, T, s); ++checks; }
     std::printf("mmvq_v2_parity: %d of %d checks bitwise equal (single and grouped, T = 1..8)\n", checks - fails, checks);
     if (bench) {
         const double gbs = 1e-3;
         std::printf("--bench: cold weights, launches in a graph, medians (us per call or group; GB/s of the V2 path)\n");
         std::printf("  %-16s %2s %9s %9s %6s %8s\n", "matrix", "T", "old us", "V2 us", "x", "V2 GB/s");
         for (const Mat& m : MATS)
-            for (int T : {1, 2, 4, 5, 8}) {
+            for (int T : {1, 2, 4, 5, strata::kernels::kVerifyMaxT}) {
                 const int no[1] = {m.n_out};
                 const Timed r = time_set(1, no, m.n_in, T, s);
                 const double b = (double) strata::kernels::native_mmvq_weight_bytes(Q8, m.n_in, m.n_out);
@@ -231,7 +232,7 @@ int main(int argc, char** argv) {
                             b / r.v2_us * gbs);
             }
         for (const Group& g : GROUPS)
-            for (int T : {1, 2, 4, 5, 8}) {
+            for (int T : {1, 2, 4, 5, strata::kernels::kVerifyMaxT}) {
                 const Timed r = time_set(g.n, g.n_out, g.n_in, T, s);
                 double b = 0;
                 for (int k = 0; k < g.n; ++k) b += (double) strata::kernels::native_mmvq_weight_bytes(Q8, g.n_in, g.n_out[k]);

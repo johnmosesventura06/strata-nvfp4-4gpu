@@ -1,5 +1,5 @@
 // src/kernels/kv_steps_parity.cpp - the batched K/V append (#783 PR-d): kv_append_q8_steps / kv_append_q4_steps for
-// n = 1..8 cells in one launch against n calls of the single-cell append, memcmp on every pool byte.
+// n = 1..kVerifyMaxT cells in one launch against n calls of the single-cell append, memcmp on every pool byte.
 //
 // Cells land at scattered positions through a non-identity page table; the K/V rows are random with small, large and
 // all-zero groups. Three layouts: INT8 K and V, Q4_0 K and V, and the K8V4 hybrid's folded call (the K pool passed as
@@ -7,6 +7,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -66,7 +67,7 @@ int main() {
     uint16_t *hs1 = dalloc<uint16_t>(q8s), *hs2 = dalloc<uint16_t>(q8s);
 
     int total_cases = 0;
-    for (int n = 1; n <= 8; ++n) {
+    for (int n = 1; n <= strata::kernels::kVerifyMaxT; ++n) {
         for (int round = 0; round < 3; ++round) {
             zero(kq1, q8n); zero(vq1, q8n); zero(kq2, q8n); zero(vq2, q8n);
             zero(ks1, q8s); zero(vs1, q8s); zero(ks2, q8s); zero(vs2, q8s);

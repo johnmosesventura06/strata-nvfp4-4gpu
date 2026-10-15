@@ -6,7 +6,7 @@
 // 1. native_gr_post_multi against n native_gr_post calls (the hyper-connection write before the PLE block).
 // 2. native_ple_postops_batch_snap (STRATA_DF_PLE) against the per-token loop of the verify window: per token
 //    native_ple_postops, ple_history_advance and a copy of the history (the commit's snapshot); the results, the final
-//    history and every snapshot, for windows of 2..8 tokens.
+//    history and every snapshot, for windows of 2..kVerifyMaxT tokens.
 // GPU, synthetic, no model.
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -16,6 +16,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -76,7 +77,7 @@ void gr_post(cudaStream_t s) {
     const int N = 2560, HC = 4;
     std::mt19937 rng(12);
     std::normal_distribution<float> nd(0.f, 1.f);
-    for (int n : {2, 4, 8}) {
+    for (int n : {2, 4, k::kVerifyMaxT}) {
         std::vector<float> r((size_t) n * HC * N), bo((size_t) n * N), inj((size_t) n * HC);
         for (auto& x : r) x = nd(rng);
         for (auto& x : bo) x = nd(rng);
@@ -114,7 +115,7 @@ void ple(cudaStream_t s) {
     w.conv1d_f16 = upload(conv);
     std::vector<float> hist0((size_t) HS);
     for (auto& x : hist0) x = nd(rng);
-    for (int n : {2, 3, 4, 8}) {
+    for (int n : {2, 3, 4, k::kVerifyMaxT}) {
         std::vector<float> key((size_t) n * D), hid((size_t) n * D), val((size_t) n * N);
         for (auto& x : key) x = 4.f * nd(rng);
         for (auto& x : hid) x = nd(rng);

@@ -392,7 +392,7 @@ int main(int argc, char** argv) {
         cudaFree(d_o); cudaFree(d_z); cudaFree(d_sn); cudaFree(d_y);
     }
 
-    // ================= 5. the verify-window kernels, T = 1..8, bitwise against the single-token kernels =================
+    // ================= 5. the verify-window kernels, T = 1..kVerifyMaxT, bitwise against the single-token kernels ======
     // gdn_ab_multi and gdn_step_norm_multi are documented as bitwise `fused_gdn_ab` / `fused_gdn_step_norm` per
     // token (verify_kernels.hpp). Every T from 1 to kVerifyMaxT is its own exact-T instantiation, so each is run,
     // and every output and the state are compared with memcmp (not a tolerance).

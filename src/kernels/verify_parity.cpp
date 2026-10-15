@@ -54,12 +54,12 @@ int test_argmax(std::mt19937& rng, cudaStream_t s) {
     using namespace strata::kernels;
     int bad = 0;
     std::normal_distribution<float> nd(0.0f, 4.0f);
-    uint8_t* sa = dev<uint8_t>(argmax_rows_scratch_bytes(8));   // one scratch for every row count, as in the engine
-    uint8_t* st = dev<uint8_t>(row_top_prob_scratch_bytes(8));
-    check(cudaMemset(sa, 0, argmax_rows_scratch_bytes(8)), "memset");
-    check(cudaMemset(st, 0, row_top_prob_scratch_bytes(8)), "memset");
+    uint8_t* sa = dev<uint8_t>(argmax_rows_scratch_bytes(strata::kernels::kVerifyMaxT));   // one scratch for every row count, as in the engine
+    uint8_t* st = dev<uint8_t>(row_top_prob_scratch_bytes(strata::kernels::kVerifyMaxT));
+    check(cudaMemset(sa, 0, argmax_rows_scratch_bytes(strata::kernels::kVerifyMaxT)), "memset");
+    check(cudaMemset(st, 0, row_top_prob_scratch_bytes(strata::kernels::kVerifyMaxT)), "memset");
     for (const int n : {248320, 40525, 4097, 33}) {
-        for (const int rows : {4, 8, 1, 3, 8, 2}) {
+        for (const int rows : {4, strata::kernels::kVerifyMaxT, 1, 3, strata::kernels::kVerifyMaxT, 2}) {
             std::vector<float> h((size_t) rows * n);
             for (float& v : h) v = nd(rng);
             for (int r = 0; r < rows; ++r) {

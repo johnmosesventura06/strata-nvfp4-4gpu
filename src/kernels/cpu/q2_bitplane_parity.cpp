@@ -7,6 +7,7 @@
 //   3. the legacy path is untouched when the switch is off (this test only runs with the switch on: ctest sets it).
 // Synthetic data, CPU only; skipped (pass) on a CPU without AVX2.
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -38,19 +39,20 @@ int main() {
                 std::memcpy(blk, &d, 2);
                 for (int i = 0; i < 16; ++i) blk[2 + i] = (uint8_t) rng();
             }
-        const int NT = 8;
-        static c::ActQ acts[8];
+        const int NT = strata::kernels::kVerifyMaxT;
+        static c::ActQ acts[strata::kernels::kVerifyMaxT];
         std::vector<std::vector<float>> xs(NT, std::vector<float>((size_t) n));
         for (int t = 0; t < NT; ++t) {
             for (float& v : xs[(size_t) t]) v = nd(rng) * (t % 3 == 0 ? 8.f : 1.f);
             c::act_quant_q8_1_avx2(xs[(size_t) t].data(), n, acts[t]);
             if (acts[t].bp_pairs != nblocks / 2) { std::printf("FAIL n=%d: no bit-plane image\n", n); ++fail; }
         }
-        const c::ActQ* ap[8];
+        const c::ActQ* ap[strata::kernels::kVerifyMaxT];
         for (int t = 0; t < NT; ++t) ap[t] = &acts[t];
         // the whole window at once, with the bit-plane kernel
         std::vector<std::vector<float>> win(NT, std::vector<float>((size_t) rows)), ref = win, alone = win, cut = win;
-        float* wo[8]; float* ro[8]; float* ao[8]; float* co[8];
+        float* wo[strata::kernels::kVerifyMaxT]; float* ro[strata::kernels::kVerifyMaxT];
+        float* ao[strata::kernels::kVerifyMaxT]; float* co[strata::kernels::kVerifyMaxT];
         for (int t = 0; t < NT; ++t) { wo[t] = win[(size_t) t].data(); ro[t] = ref[(size_t) t].data();
                                        ao[t] = alone[(size_t) t].data(); co[t] = cut[(size_t) t].data(); }
         c::q2_0_gguf_rows_multi_avx2(w.data(), row_bytes, nblocks, ap, NT, wo, 0, rows);

@@ -9,6 +9,7 @@
 // DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -424,7 +425,7 @@ void bench_sampled() {
     check(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(20);
     std::normal_distribution<float> g(0.0f, 3.0f);
-    for (int T : {1, 4, 8}) {
+    for (int T : {1, 4, strata::kernels::kVerifyMaxT}) {
         std::vector<float> l((size_t) NV * T);
         for (auto& v : l) v = g(rng);
         float* d_l = nullptr;
@@ -885,7 +886,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> tail((size_t) TAIL);
         for (auto& v : tail) v = (int32_t) (rng() % NV);
         int observable = 0, rows_checked = 0;
-        for (int T : {1, 2, 4, 8}) {
+        for (int T : {1, 2, 4, strata::kernels::kVerifyMaxT}) {
             for (int H : {1, 64, 1024, 4096}) {
                 std::vector<int32_t> window((size_t) T);
                 for (int t = 0; t < T; ++t) window[(size_t) t] = (int32_t) (100 + 37 * t);   // distinct, in range
@@ -995,7 +996,7 @@ int main(int argc, char** argv) {
     {
         int wrong = 0, cases = 0;
         for (int n_tail : {0, 1, 5, 63, 64, 65, 300}) {
-            for (int T : {1, 3, 8}) {
+            for (int T : {1, 3, strata::kernels::kVerifyMaxT}) {
                 for (int h : {1, 4, 64, 100}) {
                     std::vector<int32_t> tail((size_t) n_tail), window((size_t) T);
                     for (int i = 0; i < n_tail; ++i) tail[(size_t) i] = 1000 + i;

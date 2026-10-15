@@ -1,10 +1,11 @@
 // src/kernels/gr_multi_parity.cpp - the multi-token hyper-connection read and write (#783 PR-g: gr_read_multi,
 // gr_write_multi and the exact-T BF16 projections under them) against the single-token calls, memcmp.
 //
-// Real geometry (n_embd 2560, hc 4, hc_lr 320), the pinned native MMVF path, every T = 1..8, with and without an
+// Real geometry (n_embd 2560, hc 4, hc_lr 320), the pinned native MMVF path, every T = 1..kVerifyMaxT, with and without an
 // injection weight (a layer read vs the final mixer), and the write both out of place and in place (R_out == R).
 // Each output of the multi call must equal the token-by-token one bit for bit. GPU, synthetic, no model.
 #include "strata/kernels/gr.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -74,7 +75,7 @@ int main() {
     k::gr_workspace_init(sh, ws_raw, ws);
 
     int cases = 0, bad = 0;
-    for (int T = 1; T <= 8; ++T) {
+    for (int T = 1; T <= strata::kernels::kVerifyMaxT; ++T) {
         std::vector<float> R((size_t) T * hc_dim);
         for (int t = 0; t < T; ++t)
             for (long long c = 0; c < hc; ++c)

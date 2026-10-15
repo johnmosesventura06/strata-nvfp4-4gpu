@@ -25,6 +25,7 @@
 // kernels agreeing on garbage would otherwise pass.
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -265,10 +266,10 @@ void check_all() {
     const Fixture fx = make_blobs(12, rng);
     constexpr int K = 10;
 
-    // Activations for up to 8 tokens, device copies with and without the fp32 scales.
+    // Activations for up to kVerifyMaxT tokens, device copies with and without the fp32 scales.
     std::vector<uint8_t> x;
     std::vector<float> xs;
-    fill_x(x, xs, 8, rng);
+    fill_x(x, xs, k::kVerifyMaxT, rng);
     uint8_t* d_x = dalloc<uint8_t>(x.size());
     float* d_xs = dalloc<float>(xs.size());
     up(d_x, x);
@@ -366,9 +367,9 @@ void check_all() {
         reference("moe_hit_grouped_s2_multi (4 tokens, 29 hits)", r, s, ent, x, &xs);
     }
 
-    // ---- 4. moe_grouped_s2: 8 tokens x 10 entries in groups of 1..8, one group on a mapped host blob
+    // ---- 4. moe_grouped_s2: kVerifyMaxT tokens x 10 entries in groups of 1..8, one group on a mapped host blob
     {
-        const int T = 8, n = T * K;
+        const int T = k::kVerifyMaxT, n = T * K;
         uint8_t* h_host = nullptr;
         uint8_t* d_host = nullptr;
         ck(cudaHostAlloc((void**) &h_host, BLOB, cudaHostAllocMapped), "host blob");

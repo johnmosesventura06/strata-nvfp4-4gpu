@@ -9,7 +9,7 @@
 // Also the down rows (n 640) and gate/up through silu with the blob tail's scales, 1..9 tokens (past one slice).
 // The AVX2 rows follow ggml's AVX2 path step for step, so for them every row must also be bit-equal (ggml-cpu built
 // with AVX2: STRATA_PORTABLE, or a native build). Each kernel is checked when this CPU runs it.
-// Speed: gate+up rows of one expert for 1..8 tokens, each way, as the CPU pool runs them.
+// Speed: gate+up rows of one expert for 1..kVerifyMaxT tokens, each way, as the CPU pool runs them.
 //
 //     nvfp4_avx512_parity --bw THREADS TOKENS [ggml|avx2]
 //     nvfp4_avx512_parity --expert pack/experts.bin [layer expert]
@@ -23,6 +23,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -155,11 +156,11 @@ void speed(const std::vector<uint8_t>& w, std::mt19937& rng, bool has512, bool h
     const ggml_type_traits_cpu* ta = ggml_get_type_traits_cpu(tw->vec_dot_type);
     const size_t act_bytes = ggml_row_size(tw->vec_dot_type, N);
     std::normal_distribution<float> nd(0.f, 1.f);
-    std::vector<std::vector<uint8_t>> act(8, std::vector<uint8_t>(act_bytes));
-    std::vector<float> x(N), sink(8 * ROWS);
-    const void* ap[8];
-    float* op[8];
-    for (int t = 0; t < 8; ++t) {
+    std::vector<std::vector<uint8_t>> act(strata::kernels::kVerifyMaxT, std::vector<uint8_t>(act_bytes));
+    std::vector<float> x(N), sink(strata::kernels::kVerifyMaxT * ROWS);
+    const void* ap[strata::kernels::kVerifyMaxT];
+    float* op[strata::kernels::kVerifyMaxT];
+    for (int t = 0; t < strata::kernels::kVerifyMaxT; ++t) {
         for (float& v : x) v = nd(rng);
         ta->from_float(x.data(), act[t].data(), N);
         ap[t] = act[t].data();
@@ -167,7 +168,7 @@ void speed(const std::vector<uint8_t>& w, std::mt19937& rng, bool has512, bool h
     }
     std::printf("\n%-6s %10s %10s %8s %10s %8s   (one expert's gate+up, %d rows; best of 20)\n", "tokens",
                 "ggml ms", "avx512 ms", "speedup", "avx2 ms", "speedup", ROWS);
-    for (int nt = 1; nt <= 8; ++nt) {
+    for (int nt = 1; nt <= strata::kernels::kVerifyMaxT; ++nt) {
         double tg = 1e30, tm = 1e30, t2 = 1e30;
         for (int rep = 0; rep < 20; ++rep) {
             double t0 = now_ms();

@@ -4,7 +4,7 @@
 //
 //     iq_avx2_parity [--cpu N]
 //         IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS gate/up rows, IQ4_NL and Q2_0 down rows: every variant
-//         this CPU runs, 1..8 tokens, each token's rows bit for bit the scalar variant's rows for that token alone (so
+//         this CPU runs, 1..kVerifyMaxT tokens, each token's rows bit for bit the scalar variant's rows for that token alone (so
 //         also the same at every width, #152); the scalar rows against ggml-cpu's vec_dot (Q2_0: a double
 //         reference), rel <= 1e-5; and where the engine's dispatch (native_gu_rows) takes the multi-token kernel from
 //         one token on (native_gu_mt_min), each token's rows the same alone and in a group.
@@ -21,6 +21,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -58,7 +59,7 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 constexpr int64_t kH = 2560, kFF = 640;   // the experts' geometry: n_embd, expert width
-constexpr int kMaxT = 8;
+constexpr int kMaxT = strata::kernels::kVerifyMaxT;   // the window's rows: the harness follows the constant
 
 // ---- the variants: the public dispatch only in a DISPATCH_ONLY build
 #if defined(STRATA_IQ_PARITY_DISPATCH_ONLY)

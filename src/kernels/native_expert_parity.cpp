@@ -19,6 +19,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "ggml.h"
 
@@ -184,7 +185,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             if (gu_diff || dn_diff) ++failures;
         }
         // UD-Q4_K_XL's formats: the multi-token AVX2 kernels (kq_avx2.cpp) against ggml-cpu's vec_dot per token,
-        // BIT FOR BIT, for 1..8 tokens; then the time of 4 tokens (a verify window) both ways
+        // BIT FOR BIT, for 1..kVerifyMaxT tokens; then the time of 4 tokens (a verify window) both ways
         for (int role = 0; role < 2; ++role) {
             const int type = role == 0 ? f.gu_type : f.d_type;
             if (!cpu::cpu_avx2_ok() || !cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
@@ -193,22 +194,22 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             const uint8_t* w = blob.data() + (role == 0 ? 0 : f.down_off);
             const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
             const ggml_type at = tc->vec_dot_type;
-            std::vector<std::vector<uint8_t>> acts(8, std::vector<uint8_t>(ggml_row_size(at, n)));
+            std::vector<std::vector<uint8_t>> acts(strata::kernels::kVerifyMaxT, std::vector<uint8_t>(ggml_row_size(at, n)));
             std::mt19937 arng(77 + seed);
             std::normal_distribution<float> and_(0.f, 1.f);
             std::vector<float> xs((size_t) n);
-            const void* ap[8];
-            for (int t = 0; t < 8; ++t) {
+            const void* ap[strata::kernels::kVerifyMaxT];
+            for (int t = 0; t < strata::kernels::kVerifyMaxT; ++t) {
                 for (auto& v : xs) v = and_(arng);
                 ggml_get_type_traits_cpu(at)->from_float(xs.data(), acts[t].data(), n);
                 ap[t] = acts[t].data();
             }
-            std::vector<float> ref((size_t) 8 * rows), got((size_t) 8 * rows);
-            for (int t = 0; t < 8; ++t)
+            std::vector<float> ref((size_t) strata::kernels::kVerifyMaxT * rows), got((size_t) strata::kernels::kVerifyMaxT * rows);
+            for (int t = 0; t < strata::kernels::kVerifyMaxT; ++t)
                 for (int r = 0; r < rows; ++r) tc->vec_dot(n, &ref[(size_t) t * rows + r], 0, w + (size_t) r * rb, 0, ap[t], 0, 1);
             size_t differ = 0;
-            for (int nt = 1; nt <= 8; ++nt) {
-                float* op[8];
+            for (int nt = 1; nt <= strata::kernels::kVerifyMaxT; ++nt) {
+                float* op[strata::kernels::kVerifyMaxT];
                 for (int t = 0; t < nt; ++t) op[t] = got.data() + (size_t) t * rows;
                 cpu::kq256_rows(type, w, rb, n, ap, nt, op, 0, rows);
                 for (int t = 0; t < nt; ++t)
@@ -225,9 +226,11 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             auto t2 = std::chrono::steady_clock::now();
             const double us_k = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
             const double us_g = std::chrono::duration<double, std::micro>(t2 - t1).count() / it;
-            std::printf("          %s %s rows, AVX2 multi-token vs ggml vec_dot: %zu of 36 token-sets differ in any bit; "
+            std::printf("          %s %s rows, AVX2 multi-token vs ggml vec_dot: %zu of %zu token-sets differ in any bit; "
                         "4 tokens one thread %.0f us vs ggml %.0f us (%.2fx)\n", ggml_type_name((ggml_type) type),
-                        role == 0 ? "gate" : "down", differ, us_k, us_g, us_g / us_k);
+                        role == 0 ? "gate" : "down", differ,
+                        (size_t) strata::kernels::kVerifyMaxT * (strata::kernels::kVerifyMaxT + 1) / 2,
+                        us_k, us_g, us_g / us_k);
             if (differ) ++failures;
         }
         if (cpu::q2_native_kernels(f.d_type)) {
