@@ -332,7 +332,10 @@ class Telemetry:
                 s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
                               "pcie_gen": r.get("pcie_gen"), "pcie_gen_max": r.get("pcie_gen_max"),
-                              "pcie_width": r.get("pcie_width")}
+                              "pcie_width": r.get("pcie_width"),
+                              # issue #112: NVML reads PCIe traffic per device, so each card's tile can show its own
+                              # rather than only the total the gpu_* readings sum
+                              "pcie_rx_mb": r.get("pcie_rx_mb"), "pcie_tx_mb": r.get("pcie_tx_mb")}
                              for i, r in reads]
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
@@ -366,6 +369,10 @@ class Telemetry:
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+                for g in s.get("gpus") or ():      # issue #112: one PCIe series per card, for that tile's sparkline
+                    for k in ("pcie_rx_mb", "pcie_tx_mb"):
+                        if g.get(k) is not None:
+                            self.hist[f"gpu{g.get('index')}_{k}"].append(round(g[k], 2))
             self._stop.wait(1.0)
 
     def snapshot(self):

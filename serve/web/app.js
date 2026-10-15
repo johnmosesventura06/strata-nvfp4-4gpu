@@ -121,11 +121,12 @@ const METRICS = [
 ];
 // Several cards (issue #112): their slots differ - the trunk sits on Gen4 x8, a tier card on Gen5 x4 - so the PCIe
 // card splits into one per GPU instead of a run-on line, and they are appended after the standing eight where four
-// of them fill one row of the grid.  The engine only counts PCIe traffic into the hot slot, not per card, so that
-// rate stays a card of its own (the plain PCIe card keeps the link on a server too old to send them per card).
+// of them fill one row of the grid.  Each tile shows its own PCIe traffic (NVML reads it per device) with the link it
+// negotiated underneath; the gpu_* total keeps its own card, and a server that sends neither keeps the plain PCIe
+// card exactly as it was.
 const linkCard = (g, i) => {
   const n = g.index == null ? i : g.index;
-  return {key: `pcie${n}`, label: `PCIe GPU ${n}`, icon: "link", unit: "", tone: "info", link: true};
+  return {key: `pcie${n}`, label: `PCIe GPU ${n}`, icon: "link", unit: "", tone: "info"};
 };
 // a server too old to send the links per card keeps the one PCIe card as it was
 const splitPcie = (gpus) => (gpus || []).length > 1 && gpus.every((g) => g.pcie_gen_max || g.pcie_gen);
@@ -143,12 +144,12 @@ function cardHtml(m) {
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
     </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
     <span class="st-metric__sub" id="ms-${m.key}"></span>`}
-    ${m.link ? "" : `<svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
+    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
       stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
       ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
         <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>`}
+        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
   </div></div>`;
 }
 // the cards are rebuilt only when the set actually changes: a GPU count that moves (a card swapped, a server
@@ -322,10 +323,21 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // traffic the engine counts is the hot slot's, not per card, so it keeps the PCIe card as its own total.
   buildCards(hw.gpus);
   if (splitPcie(hw.gpus)) {
+    // each card's own PCIe traffic with its link underneath; a server that doesn't sample the traffic per card
+    // (before issue #112's telemetry) keeps the link as the headline instead of an empty tile
+    const idle = (g) => (g.pcie_gen_max && g.pcie_gen != null && g.pcie_gen < g.pcie_gen_max ? `idle Gen${g.pcie_gen}` : "");
     (hw.gpus || []).forEach((g, i) => {
+      const n = g.index == null ? i : g.index;
       const gmax = g.pcie_gen_max || g.pcie_gen;
-      setMetric(`pcie${g.index == null ? i : g.index}`, gmax ? `Gen${gmax}` : null, g.pcie_width ? `x${g.pcie_width}` : "",
-                gmax && g.pcie_gen != null && g.pcie_gen < gmax ? `idle Gen${g.pcie_gen}` : "");
+      const link = [gmax ? `Gen${gmax}` : "", g.pcie_width ? `x${g.pcie_width}` : ""].filter(Boolean).join(" ");
+      if (g.pcie_rx_mb == null) {
+        setMetric(`pcie${n}`, gmax ? `Gen${gmax}` : null, g.pcie_width ? `x${g.pcie_width}` : "", idle(g));
+        return;
+      }
+      const big = g.pcie_rx_mb >= 1000;
+      setMetric(`pcie${n}`, big ? fmt(g.pcie_rx_mb / 1024, 2) : fmt(g.pcie_rx_mb, g.pcie_rx_mb < 10 ? 1 : 0),
+                big ? "GB/s" : "MB/s", [link, idle(g)].filter(Boolean).join(" · "));
+      spark(`sp-pcie${n}`, h[`gpu${n}_pcie_rx_mb`]);
     });
     const rate = (x) => x >= 1000 ? `${fmt(x / 1024, 2)} GB/s` : `${fmt(x, x < 10 ? 1 : 0)} MB/s`;
     setMetric("pcie", hw.gpu_pcie_rx_mb == null ? null : fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0),
