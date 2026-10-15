@@ -2094,6 +2094,34 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+def peer_device_list(cfg: dict) -> list[int]:
+    """The expert-cache tier's cards named in the engine's args: --peer-device / --peer-devices with a comma list
+    ("1,2,3") as the next argument or inline (=1,2,3); [] when the args name none."""
+    args = [str(x) for x in cfg.get("args", [])]
+    out: list[int] = []
+    for i, a in enumerate(args):
+        flag, _, inline = a.partition("=")
+        if flag not in ("--peer-device", "--peer-devices"):
+            continue
+        for part in (inline if inline else (args[i + 1] if i + 1 < len(args) else "")).replace(",", " ").split():
+            if part.isdigit():
+                out.append(int(part))
+    return out
+
+
+def monitored_gpus(cfg: dict) -> list[int]:
+    """Every card the Monitor reads (issue #112): the config's "gpu" cards, plus the expert-cache tier's cards the
+    engine args name - --peer-devices needs no "gpu" in the config, so gpu_list alone misses the split's cards.
+    The engine's own card (0 when "gpu" names none) joins them, so the main card is on the dashboard too.
+    [] leaves the single-card reading as it was: the first "gpu" card, else card 0."""
+    peers = peer_device_list(cfg)
+    cards = set(gpu_list(cfg)) | set(peers)
+    if peers and not gpu_list(cfg):
+        cards.add(0)
+    cards = sorted(cards)
+    return cards if len(cards) > 1 else gpu_list(cfg)
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -5982,7 +6010,7 @@ def main() -> int:
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    svc.gpu_indices = monitored_gpus(cfg)               # ... or every card it works on, the peer tiers included (#112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view

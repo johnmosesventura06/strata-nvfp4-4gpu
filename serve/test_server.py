@@ -1958,6 +1958,20 @@ class PeerDevice(unittest.TestCase):
         env = child_env({"args": ["--peer-device", "1"], "gpu": [0, 1]})
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
 
+    def test_monitor_reads_the_peer_cards_too(self):
+        """The Monitor samples every card the engine works on, not just card 0: the tier's cards come from the
+        args (--peer-devices 1,2,3, no "gpu" in the config), and the engine's own card joins them."""
+        from serve.server import peer_device_list, monitored_gpus
+        self.assertEqual(peer_device_list({"args": ["--native", "x", "--peer-devices", "1,2,3", "--spec", "6"]}),
+                         [1, 2, 3])
+        self.assertEqual(peer_device_list({"args": ["--peer-device", "1"]}), [1])
+        self.assertEqual(peer_device_list({"args": ["--peer-devices=2,3"]}), [2, 3])
+        self.assertEqual(peer_device_list({"args": ["--native", "x"]}), [])
+        self.assertEqual(monitored_gpus({"args": ["--peer-devices", "1,2,3"]}), [0, 1, 2, 3])   # our lane's shape
+        self.assertEqual(monitored_gpus({"args": ["--peer-device", "1"], "gpu": [0, 1]}), [0, 1])
+        self.assertEqual(monitored_gpus({"args": ["--native", "x"]}), [])                        # one card: as it was
+        self.assertEqual(monitored_gpus({"args": ["--native", "x"], "gpu": [2]}), [2])
+
 
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
