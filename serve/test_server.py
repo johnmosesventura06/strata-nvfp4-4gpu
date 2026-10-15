@@ -3883,6 +3883,36 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+class MultiCardTelemetry(unittest.TestCase):
+    """issue #112: with several cards the Monitor shows each one's own row - the PCIe link must ride along per
+    card, since the slots differ (a Gen4 x8 trunk beside Gen5 x4 tiers)."""
+
+    class Fake:
+        def __init__(self, gen, width):
+            self.r = {"util": 50, "mem_used": 1 << 30, "mem_total": 2 << 30, "temp": 40.0, "power": 100.0,
+                      "pcie_gen": gen, "pcie_gen_max": gen, "pcie_width": width}
+
+        def ok(self):
+            return True
+
+        def name(self):
+            return "Fake GPU"
+
+        def read(self):
+            return dict(self.r)
+
+    def test_links_of_each_card(self):
+        from serve import telemetry
+        fake = {1: self.Fake(4, 8), 3: self.Fake(5, 4)}
+        with mock.patch.object(telemetry, "gpu_reader", lambda i, amd=False: fake[i]):
+            t = telemetry.Telemetry(gpu_index=1, gpu_indices=[1, 3])
+            s = t.sample()
+            t.close()
+        self.assertEqual([(g["index"], g["pcie_gen_max"], g["pcie_width"]) for g in s["gpus"]],
+                         [(1, 4, 8), (3, 5, 4)])
+        self.assertEqual((s["gpu_util"], s["gpu_mem_used"]), (50.0, 2 << 30))     # mean load, total memory
+
+
 class AmdTelemetry(unittest.TestCase):
     """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
     cards (the CPU node skipped), and free_vram_mib on HIP."""
