@@ -18,28 +18,34 @@
 
 namespace strata::kernels {
 
-// The window's rows: 12, so one round of three batch slots carrying three MTP proposals each (3 x (1+3))
-// is ONE launch instead of two windows -- the window's fixed part (graph launch, per-layer doorbell,
-// commit, emit, head merge) is what a second window would pay again.
+// The window's rows: 8, and MEASURED, not guessed -- it is both the cap and the floor.
 //
-// 12 is the largest this can be: expert_source's kMaxWindowEntries and verify_kernels' kResidentPlanMax
-// are 128 per-layer entries = 12 tokens x top-10, so 13 will not compile.  It travels with cpu::MAXT
-// (the pool's tables), s2_expert_grouped's GMAX, native_mmvq's MAX_NCOLS and fused_gr's kFusedGrMaxT --
-// each of those is an ARRAY bound or a capacity clamp, and each kernel keeps a token's arithmetic
-// independent of how many tokens ride along.  THAT is the thing to prove when touching this number, not
-// to assume: several *_parity harnesses used to loop `T = 1..8` as a LITERAL, which silently stops
-// proving anything the moment the constant moves, and the bf16 rows/TS arms had no row-count harness at
-// all.  When you raise this, grep the harnesses for literals 8 and widen them, then run the whole set on
-// every architecture the machine has (here sm_86 and sm_120: the caps that bind are per-block shared
-// memory and the 32-value butterfly in s26_tsum, and both differ by device).
+// RAISING it to 12 works (three slots x (1 own token + 3 MTP proposals) = 12 rows in one window, greedy batch
+// output bitwise equal to solo, harnesses green on sm_86 and sm_120) and is still not worth it: at three
+// concurrent streams on the NVFP4 lane, 3 proposals/slot measured 97-98 tok/s against 135-138 for one, and
+// 2 proposals 113 -- because a fed row costs ~4.4 ms of trunk while a proposal past the first is accepted only
+// 31% / 20% of the time (break-even is ~60%). One proposal per slot is this engine's optimum. Notes:
+// ~/notes/20261015-12row-window-census.md.
+// LOWERING it to 6 does not even boot: the prompt path chunks its router MMVQ in groups of EIGHT columns
+// (bf16_gemv_fp32_mmvf_cols), so MAX_NCOLS < 8 throws during init -- 8 is the width the prefill was built
+// around, not just a decode-window cap.
 //
-// The SYCL mirror (sycl/) still computes at most 8 rows in native_bf16.dp.cpp's NT ladder and cannot be
-// built or witnessed from this tree, so that backend pins its own ceiling below rather than accept a
-// window it would silently truncate.  Raising it is a SYCL change, with SYCL's build and parity runs.
+// If you raise it again, the census of what actually gates it (each found by an instrument or a harness, never
+// by reading): cpu::MAXT + s2_expert_grouped's GMAX + native_mmvq's MAX_NCOLS + fused_gr's kFusedGrMaxT; the
+// row-indexed arrays in verify.hpp / mtp.hpp / split_head.hpp (several were literal 8/9 -- last_pos_b_ carries
+// the commit record's positions, so an overflow there writes WRONG KV CELLS with no error); the CPU kernels
+// whose internals hold eight tokens on the stack (kq_avx1/2's acc[8], iq_avx2's y[8] -- they tile now); and
+// native_bf16's STRATA_TSUM arms, whose butterfly folds at most RPB*NT = 32 values. 12 is the largest the
+// per-layer entry tables allow (kMaxWindowEntries = kResidentPlanMax = 128 = 12 tokens x top-10).
+// The *_parity harnesses follow this constant now -- they used to loop to a literal 8, which passes while
+// proving nothing.
+// Both branches are 8 today. The split exists so a raise cannot silently out-run the SYCL mirror, whose
+// native_bf16 NT ladder still tops out at 8 and which cannot be built or witnessed from this tree: raise the
+// CUDA/HIP branch only after bumping sycl/src/kernels/cuda/native_bf16.dp.cpp and building that backend.
 #if defined(STRATA_SYCL_BUILD)
-inline constexpr int kVerifyMaxT = 8;
+inline constexpr int kVerifyMaxT = 8;   // the SYCL mirror's own ceiling -- read the note above before raising
 #else
-inline constexpr int kVerifyMaxT = 12;
+inline constexpr int kVerifyMaxT = 8;   // CUDA / HIP: 8 measured, see the census above
 #endif
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].

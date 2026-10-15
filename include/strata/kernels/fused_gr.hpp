@@ -58,7 +58,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 // carry by this AND by the card's shared memory (usable / (tile * 4)), so a window wider than that
 // self-chunks -- the caller loops over row groups and every group's outputs are strictly per-token.
 // Moves with kVerifyMaxT.
-constexpr int kFusedGrMaxT = 12;
+constexpr int kFusedGrMaxT = 8;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);

@@ -41,7 +41,7 @@ With a layer split, the engine options go into the config's `args`:
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8 normally) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
-| `--batch-mtp-drafts N` | with `--batch-mtp`: MTP proposals verified per slot per round (default 1). A slot's chain costs `1 + N` window rows; a round spans as many windows as the live slots' chains need. The chain length is CONSTANT while the slots live - the drafter is asked for its full chain every round - because a chain that varied per round would re-key the window's captured graphs every round and pay a capture inside the round. `strata batch drafts:` reports the accepted/offerered ratio per position, which is where a length policy would start. |
+| `--batch-mtp-drafts N` | with `--batch-mtp`: MTP proposals verified per slot per round (default 1, and 1 is the measured optimum -- see the table below). A slot's chain costs `1 + N` window rows; a round spans as many windows as the live slots' chains need. The chain length is CONSTANT while the slots live - the drafter is asked for its full chain every round - because a chain that varied per round would re-key the window's captured graphs every round and pay a capture inside the round. `strata batch drafts:` reports the accepted/offered ratio per position, which is where a length policy would start. |
 | `--batch-groups G` | with a layer split (default: auto, below): the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
 | `--batch-groups auto` | the default on a layer split since 0.1.41 (give no `--batch-groups`): the engine pipelines one group per GPU stage (the most that divide the slots; 8 slots on 4 GPUs = 4 groups of 2) and says so (`INFO batch_groups=G`). `--batch-groups 1` turns it off (all slots in one window, GPU after GPU). Measured, 8 clients, total tok/s against one group: 4 x R9700 166 against 86, 2 GPUs 109 against 78, 3 GPUs 110 against 78. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
@@ -98,6 +98,30 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   conversation takes an empty slot, else the one used longest ago.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
+
+## What more proposals per slot actually measured (RTX 3090 trunk + 3 x RTX 5060 Ti, NVFP4, 512K, np3)
+
+Three concurrent streams, ~13K-token salted prompts, 4000 tokens each, a fresh boot per arm, engine-measured
+lines only (`strata batch:` and `strata batch drafts:`), needle recovered at depth on every stream:
+
+| proposals per slot | rows fed | accepted/window | ms/window | aggregate decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 (the default) | 6 | 4.40 / 4.61 | 32.60 / 33.32 | **135.0 / 138.4 tok/s** |
+| 2 | 9 | 5.18 | 45.66 | 113.4 (-17%) |
+| 3 | 12, one window (`kVerifyMaxT` raised to 12 for the measurement) | 5.82 / 5.80 | 59.80 / 59.03 | 97.3 / 98.3 (-28%) |
+
+Acceptance per position in the chain, reproducible across boots: **56-70% / 31-38% / 20%**. A fed row costs
+~4.4 ms of trunk -- each row brings its own expert traffic, VRAM expert hits per layer-window going 18.9 at six
+rows to 41.0 at twelve -- and an accepted token is worth ~7.3 ms at the one-proposal rate, so a proposal row
+breaks even at ~60% acceptance. Only the first proposal sits near that line, which is also why `--batch-mtp`
+measured neutral rather than positive at 2 clients. Greedy output was bitwise equal to solo at every proposal
+count (a rejected row never enters the state), so this is a speed verdict, not a correctness one.
+
+`kVerifyMaxT` is back at 8. Raising it to 12 is proven to work and to be exact, and still buys nothing here;
+lowering it to 6 does not boot at all, because the prompt path chunks its router MMVQ into groups of eight
+columns (`bf16_gemv_fp32_mmvf_cols`) -- 8 is the width this engine's prefill was built around, not only a
+decode-window cap. The full census of what gates the ceiling, and the three silent-corruption bugs the raise
+exposed, are in `~/notes/20261015-12row-window-census.md` on the lane host.
 
 ## Exactness
 

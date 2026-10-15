@@ -825,7 +825,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
 // column (checked by bench/micro/native_mmvq_multi.cpp). The ncols = 1 kernels are untouched.
 // The window's rows arrive as columns: one read of each weight row, applied to every column, each column
 // bitwise the single-column call (mmvq_multi_parity, all widths up to this).  12 with kVerifyMaxT.
-constexpr int MAX_NCOLS = 12;
+constexpr int MAX_NCOLS = 8;
 
 // Each format splits its dot product into `load` (everything that depends only on the weight block: codes,
 // unpacked scales, block scale) and `apply` (the activation loads and the original *_impl expression). `load` runs
@@ -1304,10 +1304,6 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
         case 6: launch_multi_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 7: launch_multi_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: launch_multi_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 9: launch_multi_n<F, 9>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 10: launch_multi_n<F, 10>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 11: launch_multi_n<F, 11>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 12: launch_multi_n<F, 12>(weights, x_q8_1, y, n_in, n_out, s); break;
         default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8");
     }
 }
@@ -1593,10 +1589,6 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
         case 6: wave_launch_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 7: wave_launch_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: wave_launch_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 9: wave_launch_n<F, 9>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 10: wave_launch_n<F, 10>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 11: wave_launch_n<F, 11>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 12: wave_launch_n<F, 12>(weights, x_q8_1, y, n_in, n_out, s); break;
         default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
     }
 }
@@ -1767,10 +1759,6 @@ bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
         case 6: q8_packed_launch<6>(found->second, x, y, s); break;
         case 7: q8_packed_launch<7>(found->second, x, y, s); break;
         case 8: q8_packed_launch<8>(found->second, x, y, s); break;
-        case 9: q8_packed_launch<9>(found->second, x, y, s); break;
-        case 10: q8_packed_launch<10>(found->second, x, y, s); break;
-        case 11: q8_packed_launch<11>(found->second, x, y, s); break;
-        case 12: q8_packed_launch<12>(found->second, x, y, s); break;
         default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
     }
     launch_check();
@@ -1906,10 +1894,6 @@ bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
         case 6: q6_packed_launch<6>(found->second, x, y, s); break;
         case 7: q6_packed_launch<7>(found->second, x, y, s); break;
         case 8: q6_packed_launch<8>(found->second, x, y, s); break;
-        case 9: q6_packed_launch<9>(found->second, x, y, s); break;
-        case 10: q6_packed_launch<10>(found->second, x, y, s); break;
-        case 11: q6_packed_launch<11>(found->second, x, y, s); break;
-        case 12: q6_packed_launch<12>(found->second, x, y, s); break;
         default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
     }
     launch_check();
@@ -2480,10 +2464,6 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
         case 6: q8_0_pair_launch<6>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 7: q8_0_pair_launch<7>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 8: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 9: q8_0_pair_launch<9>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 10: q8_0_pair_launch<10>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 11: q8_0_pair_launch<11>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 12: q8_0_pair_launch<12>(a, b, x, y1, y2, n_in, n_out, s); break;
         default: throw std::invalid_argument("native MMVQ (q8_0 pair) requires 2 <= ncols <= " + std::to_string(MAX_NCOLS));
     }
     launch_check();
@@ -2520,10 +2500,6 @@ bool native_q8_0_mmvq_group(int n, const void* const* weights, float* const* y, 
         case 6: v2_launch_c<6>(g, x, n_in, s); break;
         case 7: v2_launch_c<7>(g, x, n_in, s); break;
         case 8: v2_launch_c<8>(g, x, n_in, s); break;
-        case 9: v2_launch_c<9>(g, x, n_in, s); break;
-        case 10: v2_launch_c<10>(g, x, n_in, s); break;
-        case 11: v2_launch_c<11>(g, x, n_in, s); break;
-        case 12: v2_launch_c<12>(g, x, n_in, s); break;
         default: throw std::invalid_argument("native MMVQ (v2) requires 1 <= ncols <= " + std::to_string(MAX_NCOLS));
     }
     launch_check();
