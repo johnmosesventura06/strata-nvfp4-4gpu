@@ -44,6 +44,14 @@ inline __m256 bf16x8_to_f32x8_avx1(const uint16_t* p) {
 
 void bf16_rows_dot_multi_avx1(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out) {
     // each row is read once for all `nt` (<= 8) tokens, exactly as the AVX2 kernel does
+    if (nt > 8) {   // the accumulators below hold 8 tokens: a wider window tiles over this entry. x/out are
+                    // strided per token (x by cols, out by rows), so a tile writes only its own tokens and the
+                    // arithmetic per token is unchanged.
+        for (int t0 = 0; t0 < nt; t0 += 8)
+            bf16_rows_dot_multi_avx1(w, rows, cols, x + (size_t) t0 * (size_t) cols, nt - t0 < 8 ? nt - t0 : 8,
+               out + (size_t) t0 * (size_t) rows);
+        return;
+    }
     for (int r = 0; r < rows; ++r) {
         const uint16_t* wr = w + (size_t) r * (size_t) cols;
         __m256 acc[8];

@@ -464,6 +464,14 @@ int iq256_variants() noexcept { return kIq256Gather | (vnni_on() ? kIq256Vnni : 
 
 void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                      const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    if (nt > 8) {   // the kernels below hold 8 tokens' state (y[8] and friends): tile a wider window over them.
+                    // act/out/hq are per-token pointer arrays, so a tile is the same arithmetic per token.
+        for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
+            iq256_gu_rows_v(variant, type, blob, gu_row, up_off, n, act + t0, k, ff + t0, r0, r1);
+        }
+        return;
+    }
     const bool g = (variant & kIq256Gather) != 0;
 #if STRATA_AVXVNNI
     if (variant & kIq256Vnni) {
@@ -478,6 +486,14 @@ void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, 
 
 void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                   float* const* out, int r0, int r1) {
+    if (nt > 8) {   // the kernels below hold 8 tokens' state (y[8] and friends): tile a wider window over them.
+                    // act/out/hq are per-token pointer arrays, so a tile is the same arithmetic per token.
+        for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
+            iq256_rows_v(variant, type, w, row_bytes, n, act + t0, k, out + t0, r0, r1);
+        }
+        return;
+    }
     const bool g = (variant & kIq256Gather) != 0;
 #if STRATA_AVXVNNI
     if (variant & kIq256Vnni) {
@@ -502,7 +518,15 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
 
 void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                           float* const* out, int r0, int r1) {
-    const block_q8_0* y[8];
+    if (nt > 8) {   // the kernels below hold 8 tokens' state (y[8] and friends): tile a wider window over them.
+                    // act/out/hq are per-token pointer arrays, so a tile is the same arithmetic per token.
+        for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
+            iq4nl256_down_rows_v(variant, w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
+        }
+        return;
+    }
+    const block_q8_0* y[8];   // nt <= 8 here: the tiling above is what keeps that true
     for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
 #if STRATA_AVXVNNI
     if (variant & kIq256Vnni) {

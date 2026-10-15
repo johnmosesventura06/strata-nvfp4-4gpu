@@ -2880,8 +2880,26 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+    const auto ckey = bkey(last_rows_, S, row_base_);
+    const cudaError_t le = cudaGraphLaunch(commit_bm_[ckey], cs_);
+    if (le != cudaSuccess) {
+        // A null graph exec launches as "invalid argument", which names nothing. Say which layout has no graph:
+        // that is how a row-indexed array still sized by a literal 8 (last_rows_) was found once the window grew
+        // past it -- the key came back with its last four rows zeroed.
+        std::string ks, present;
+        for (int v : ckey) ks += std::to_string(v) + ",";
+        int shown = 0;
+        for (const auto& kv : commit_bm_) {
+            if (shown++ >= 8) break;
+            std::string s2;
+            for (int v : kv.first) s2 += std::to_string(v) + ",";
+            present += "[" + s2 + (kv.second ? "ok" : "NULL") + "] ";
+        }
+        err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le) + " (key [" + ks + "] S=" +
+              std::to_string(S) + " row_base=" + std::to_string(row_base_) + ", exec_bm_ has it: " +
+              (exec_bm_.count(ckey) ? "yes" : "no") + ", commit keys: " + present + ")";
+        return false;
+    }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
     if (ple_stage())

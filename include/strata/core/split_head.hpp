@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "strata/kernels/verify_kernels.hpp"   // kVerifyMaxT: the graph tables are indexed by the window's rows
 
 #include <cstdint>
 #include <string>
@@ -79,7 +80,9 @@ private:
     uint32_t *h_hand_ = nullptr, *h_done_ = nullptr;
     int32_t* h_idx_ = nullptr;
     float *h_val_ = nullptr, *h_logits_ = nullptr;
-    cudaGraphExec_t exec_[9][2] = {};
+    // indexed by the window's rows T = 1..max_t_: sized by the constant, not by a literal (a literal 9 here
+    // wrote past the object at T >= 9 -- the adjacent members are the mapped h_idx_/h_val_ pointers).
+    cudaGraphExec_t exec_[strata::kernels::kVerifyMaxT + 1][2] = {};
 };
 
 }  // namespace strata::core
