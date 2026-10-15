@@ -2463,7 +2463,7 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
                       int n_in, int n_out, int ncols, void* stream) {
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
-    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
+    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > MAX_NCOLS || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
         n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
         return false;
     const auto& reg = q8_packed_registry();
@@ -2496,7 +2496,7 @@ void native_mmvq_set_v2(bool on) { g_mmvq_v2 = on; }
 
 bool native_q8_0_mmvq_group(int n, const void* const* weights, float* const* y, const int* n_out, const void* x_q8_1,
                             int n_in, int ncols, void* stream) {
-    if (!g_mmvq_v2 || n < 1 || n > V2_MAX_MATS || ncols < 1 || ncols > 8 || n_in <= 0 || n_in % 32 != 0) return false;
+    if (!g_mmvq_v2 || n < 1 || n > V2_MAX_MATS || ncols < 1 || ncols > MAX_NCOLS || n_in <= 0 || n_in % 32 != 0) return false;
     if (ncols > 1 && !g_multi_exact) return false;   // the group kernel is the EXACT layout
     if (!x_q8_1 || !stream) return false;
     const auto& reg = q8_packed_registry();

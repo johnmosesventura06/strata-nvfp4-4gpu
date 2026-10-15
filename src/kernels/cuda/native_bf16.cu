@@ -249,7 +249,7 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
         return;
     }
     if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
-    else bf16_f32_mmvf_rows_kernel<B, 8, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    else bf16_f32_mmvf_rows_kernel<B, strata::kernels::kVerifyMaxT, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
 }
 
 int mmvf_block_size(int64_t n_in) {
