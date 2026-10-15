@@ -8972,6 +8972,12 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            // the --peer-devices tiers count like the remote caches do: this used to miss them, so a --peer-devices
+            // run reported the primary's slots alone (the tile said 4,063 while boot said "20,446 of 24,576")
+            for (int p = 0; p < n_peers; ++p) {
+                slots_all += (int64_t) peers[p].resident();
+                mib_all += (int64_t) (peers[p].gib() * 1024.0);
+            }
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
