@@ -515,8 +515,8 @@ int main(int argc, char** argv) {
             cudaFree(d_sr); cudaFree(d_nk);
         }
         cudaFree(d_wa); cudaFree(d_wb); cudaFree(d_dt); cudaFree(d_sa); cudaFree(d_gm);
-        std::printf("\n  %-42s %s (%d cases)\n", "gdn_ab_multi T=1..8 == fused_gdn_ab", ab_bad ? "*** NO ***" : "bitwise", ab_n);
-        std::printf("  %-42s %s (%d cases)\n", "gdn_step_norm_multi T=1..8 == single-token", sn_bad ? "*** NO ***" : "bitwise", sn_n);
+        std::printf("\n  %-42s %s (%d cases)\n", "gdn_ab_multi T=1.." + std::to_string(strata::kernels::kVerifyMaxT) + " == fused_gdn_ab", ab_bad ? "*** NO ***" : "bitwise", ab_n);
+        std::printf("  %-42s %s (%d cases)\n", "gdn_step_norm_multi T=1.." + std::to_string(strata::kernels::kVerifyMaxT) + " == single-token", sn_bad ? "*** NO ***" : "bitwise", sn_n);
         bad += ab_bad + sn_bad;
     }
 

@@ -471,6 +471,13 @@ void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* o
 
 void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
                              int r1) {
+    if (n_tokens > 8) {   // past the instantiations: tile them, one pass per group of at most 8 tokens
+        for (int t0 = 0; t0 < n_tokens; t0 += 8) {
+            const int k = n_tokens - t0 < 8 ? n_tokens - t0 : 8;
+            s2_expert_gu_rows_multi(blob, a1 + t0, k, ff + t0, r0, r1);
+        }
+        return;
+    }
     switch (n_tokens) {
         case 1: gu_rows_multi<1>(blob, a1, ff, r0, r1); break;
         case 2: gu_rows_multi<2>(blob, a1, ff, r0, r1); break;
@@ -485,6 +492,13 @@ void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_t
 
 void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
                                int r1) {
+    if (n_tokens > 8) {   // tile past the instantiations, as the gate/up rows do
+        for (int t0 = 0; t0 < n_tokens; t0 += 8) {
+            const int k = n_tokens - t0 < 8 ? n_tokens - t0 : 8;
+            s2_expert_down_rows_multi(blob, a2 + t0, k, out + t0, r0, r1);
+        }
+        return;
+    }
     switch (n_tokens) {
         case 1: down_rows_multi<1>(blob, a2, out, r0, r1); break;
         case 2: down_rows_multi<2>(blob, a2, out, r0, r1); break;
@@ -546,6 +560,13 @@ void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const
 
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1) {
+    if (nt > 8) {   // tile past the instantiations, as the s2 row kernels do
+        for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
+            q2_0_gguf_rows_multi(w, row_bytes, nblocks, a + t0, k, out + t0, r0, r1);
+        }
+        return;
+    }
     switch (nt) {
         case 1: q2g_rows<1>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 2: q2g_rows<2>(w, row_bytes, nblocks, a, out, r0, r1); break;
@@ -560,7 +581,8 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 
 void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
                           ExpertScratchMulti& ws) {
-    if (expert_oracle_q8_0_enabled() || n_tokens < 1 || n_tokens > MAXT) {
+    // the bound is the INSTANTIATIONS (8), not cpu::MAXT (12): past 8 the per-token form is the same arithmetic
+    if (expert_oracle_q8_0_enabled() || n_tokens < 1 || n_tokens > 8) {
         for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
         return;
     }

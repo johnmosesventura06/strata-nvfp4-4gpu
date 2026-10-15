@@ -136,7 +136,10 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
 /// ONCE per block for all tokens; only the VNNI dot and the accumulation run per token. Every token's output
 /// is bitwise equal to `s2_expert_vnni_q` on that token (same operation order per token). Legacy activation
 /// contract only; with `expert_set_oracle_q8_0(true)` it falls back to one `s2_expert_vnni_q` per token.
-inline constexpr int MAXT = 8;
+// The verify window's tokens per group (kVerifyMaxT, 12): the per-layer entry tables are sized MAXT * top-k.
+// The multi-token INSTANTIATIONS stop at 8 and longer groups tile over them -- expert.cpp's dispatches
+// chunk the token list instead of computing a short prefix, and the nvfp4 kernels slice it already.
+inline constexpr int MAXT = 12;
 /// Plan v0.3 P4: the expert in row ranges, so several threads can share one expert.  `s2_expert_gu_rows` writes
 /// ff[r] = silu(gate_r . x) * (up_r . x) for r in [r0, r1) (of FF); `s2_expert_down_rows` writes out[r] for r in
 /// [r0, r1) (of H) from the intermediate's quantized image.  Together with `act_quant_q8_1(ff, FF, a2)` in

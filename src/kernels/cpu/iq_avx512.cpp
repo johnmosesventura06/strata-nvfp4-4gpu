@@ -213,6 +213,13 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
 template <int TY>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
+    if (nt > 8) {   // tile past the instantiations, as dot_rows_nt below already does
+        for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
+            gu_rows_nt<TY>(k, blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1);
+        }
+        return;
+    }
     switch (nt) {
         case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;

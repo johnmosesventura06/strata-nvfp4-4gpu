@@ -20,8 +20,13 @@ asked, with a note when it is more than setup would recommend.
 ```
 
 On one GPU with MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the
-server's environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch
-behaviour described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so
+server's environment) lets each batch slot verify MTP proposals alongside its own token. It is opt-in; without it the
+batch behaviour described below is exactly the one without MTP. `--batch-mtp-drafts N` says how many (default 1, the
+behaviour up to 0.1.41; up to the drafter's chain length). A slot costs **1 + N rows** of the verify window, and the
+window holds 8 - three per-layer kernels (`fused_gr`'s `kFusedGrMaxT`, `shared_expert`, `native_bf16`) each assume
+at most 8 rows, so raising it is a kernel project, not a constant. Two slots therefore take 3 proposals each in
+ONE window (2 x 4 = 8 exactly); three slots at 3 each is 12 rows, so a round becomes **two windows** (8 + 4),
+paying the window's fixed cost once more. `strata batch:` and `strata batch drafts:` count both. It needs VRAM per slot for the draft state and buffers, so
 check the engine's free-memory log before using it on a smaller card. If it cannot run (one slot, no `--mtp`, a layer
 split or helper GPU) the engine says so and batches as usual. RTX PRO 5000 owners measured +31% to +39% total
 throughput with 2 to 4 clients (a RX R9700 run too); it has not been validated with a layer split.
@@ -36,6 +41,7 @@ With a layer split, the engine options go into the config's `args`:
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8 normally) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
+| `--batch-mtp-drafts N` | with `--batch-mtp`: MTP proposals verified per slot per round (default 1). A slot's chain costs `1 + N` window rows; a round spans as many windows as the live slots' chains need. The chain length is CONSTANT while the slots live - the drafter is asked for its full chain every round - because a chain that varied per round would re-key the window's captured graphs every round and pay a capture inside the round. `strata batch drafts:` reports the accepted/offerered ratio per position, which is where a length policy would start. |
 | `--batch-groups G` | with a layer split (default: auto, below): the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
 | `--batch-groups auto` | the default on a layer split since 0.1.41 (give no `--batch-groups`): the engine pipelines one group per GPU stage (the most that divide the slots; 8 slots on 4 GPUs = 4 groups of 2) and says so (`INFO batch_groups=G`). `--batch-groups 1` turns it off (all slots in one window, GPU after GPU). Measured, 8 clients, total tok/s against one group: 4 x R9700 166 against 86, 2 GPUs 109 against 78, 3 GPUs 110 against 78. |
 | `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
@@ -66,7 +72,8 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
 - **When a second request arrives**, the first is stopped (`STOP`) and continues in a batch slot with its prompt
   plus what it generated so far - the engine's prompt cache holds exactly that, so nothing is read again - and the
   new request is admitted next to it. By default, a request in a slot decodes **without MTP drafts** (one token per window).
-  With `--batch-mtp`, each slot verifies one MTP proposal alongside its current token.
+  With `--batch-mtp`, each slot verifies `--batch-mtp-drafts` MTP proposals alongside its current token (1 by
+  default), and keeps the longest run of them the target agrees with - the same prefix rule the solo path uses.
 - **A request left alone in a slot** (the others finished, nobody waits) goes back to the solo path: the slot is
   stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with
   `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off). The draft layer's own K/V was
@@ -124,7 +131,10 @@ counter-based draw (Philox(seed, position)).
 
 - By default, batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo
   path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
-- Grouped MTP currently uses one proposal per slot and requires one GPU; it does not support a layer split.
+- Grouped MTP requires one GPU and does not support a layer split: a slot's rows are one sequence at consecutive
+  positions, and the grouped rows are not wired through a split's stages (`run_slot_rows` says so).
+- Past what one window holds, a round is several windows: they run one after the other on the same card, so a
+  round of three slots at three proposals each costs a second window's fixed part.
 - Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.

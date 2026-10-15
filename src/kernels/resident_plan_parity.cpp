@@ -3,7 +3,7 @@
 // distinct experts in routing order, each with its entries ascending, `ptr[g]` = the expert's slot, counts / start /
 // dst / tok / start2 in the host pool's layout.
 //
-// n = 1..80 entries (a window of up to kVerifyMaxT tokens x 10 experts), ids drawn from pools of 3..512 experts so
+// n = 1..kVerifyMaxT*K entries (a window's tokens x 10 experts), ids drawn from pools of 3..512 experts so
 // duplicates run from "every entry the same expert" to "all distinct", with and without a slot table (`slot_off`).
 // Both modes are run: with a `skip` word (ring when the plan was built, 0 when an expert was not resident - and
 // then the plan is untouched) and without one (the all-resident graph: a non-resident expert gives an empty plan and
@@ -59,7 +59,7 @@ int main() {
     ck(cudaMemcpy(d_off, off.data(), 1024 * 8, cudaMemcpyHostToDevice), "off");
 
     int cases = 0, bad = 0;
-    for (int n = 1; n <= 80; ++n) {
+    for (int n = 1; n <= capx; ++n) {   // capx = kVerifyMaxT x K: the window's worst-case entry count, the range this must cover
         for (int variant = 0; variant < 4; ++variant) {
             const int pool = variant == 0 ? 3 : (variant == 1 ? 12 : (variant == 2 ? 40 : 512));
             std::vector<int32_t> ids(n);

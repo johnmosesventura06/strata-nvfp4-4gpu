@@ -72,7 +72,7 @@ uint16_t sane_half(std::mt19937& rng) {
 }
 
 // T = 4 is the last width where the two layouts coincide, T = 5 the first where they differ
-const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 8};
+const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 7, 8};   // every width up to MAX_NCOLS (7 was missing)
 constexpr int COINCIDE_MAX_T = 4;
 
 bool ck(cudaError_t e, const char* what) {

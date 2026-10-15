@@ -18,7 +18,17 @@
 
 namespace strata::kernels {
 
-inline constexpr int kVerifyMaxT = 8;
+// The window's rows: 12, so one round of three batch slots carrying three MTP proposals each (3 x (1+3))
+// is ONE launch instead of two windows -- the window's fixed part (graph launch, per-layer doorbell,
+// commit, emit, head merge) is what a second window would pay again.
+//
+// 12 is the largest this can be: expert_source's kMaxWindowEntries and verify_kernels' kResidentPlanMax
+// are 128 per-layer entries = 12 tokens x top-10, so 13 will not compile.  It travels with cpu::MAXT
+// (the pool's tables), s2_expert_grouped's GMAX, native_mmvq's MAX_NCOLS and fused_gr's kFusedGrMaxT --
+// each of those is an ARRAY bound or a capacity clamp, and each of their kernels keeps every token's
+// arithmetic independent of how many tokens ride along (that is what the *_parity harnesses prove, and
+// they now loop to this constant rather than to a literal 8).
+inline constexpr int kVerifyMaxT = 12;
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise
