@@ -119,7 +119,23 @@ const METRICS = [
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
-$("metrics").innerHTML = METRICS.map((m) => `
+// Several cards (issue #112): their slots differ - the trunk sits on Gen4 x8, a tier card on Gen5 x4 - so the PCIe
+// card splits into one per GPU instead of a run-on line, and they are appended after the standing eight where four
+// of them fill one row of the grid.  The engine only counts PCIe traffic into the hot slot, not per card, so that
+// rate stays a card of its own (the plain PCIe card keeps the link on a server too old to send them per card).
+const linkCard = (g, i) => {
+  const n = g.index == null ? i : g.index;
+  return {key: `pcie${n}`, label: `PCIe GPU ${n}`, icon: "link", unit: "", tone: "info", link: true};
+};
+// a server too old to send the links per card keeps the one PCIe card as it was
+const splitPcie = (gpus) => (gpus || []).length > 1 && gpus.every((g) => g.pcie_gen_max || g.pcie_gen);
+function cardList(gpus) {
+  const split = splitPcie(gpus);
+  const base = METRICS.map((m) => m.key === "pcie" && split ? {...m, label: "PCIe traffic", icon: "activity"} : m);
+  return split ? base.concat(gpus.map(linkCard)) : base;
+}
+function cardHtml(m) {
+  return `
   <div class="st-card metric-card"><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
@@ -127,13 +143,25 @@ $("metrics").innerHTML = METRICS.map((m) => `
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
     </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
     <span class="st-metric__sub" id="ms-${m.key}"></span>`}
-    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
+    ${m.link ? "" : `<svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
       stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
       ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
         <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
-  </div></div>`).join("");
+        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>`}
+  </div></div>`;
+}
+// the cards are rebuilt only when the set actually changes: a GPU count that moves (a card swapped, a server
+// restarted differently) must not add or drop a card silently behind the numbers
+let cardsSig = "";
+function buildCards(gpus) {
+  const cards = cardList(gpus);
+  const sig = cards.map((c) => c.key).join(",");
+  if (sig === cardsSig) return;
+  cardsSig = sig;
+  $("metrics").innerHTML = cards.map(cardHtml).join("");
+}
+buildCards([]);
 
 function spark(id, values, max) {
   const svg = $(id);
@@ -290,15 +318,25 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  const rx = hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : "");
-  // several cards (issue #112): their own links under the main card's - they differ per slot (Gen4 x8 trunk,
-  // Gen5 x4 tier); a server too old to send them per card leaves the row away
-  const links = multi && (hw.gpus || []).every((g) => g.pcie_gen_max || g.pcie_gen)
-              ? per((g) => `Gen${g.pcie_gen_max || g.pcie_gen}x${g.pcie_width || "?"}`) : null;
-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            [links, rx].filter(Boolean).join(" · "));
+  // one card per GPU's own link (their slots differ: Gen4 x8 under the trunk, Gen5 x4 under a tier card).  The
+  // traffic the engine counts is the hot slot's, not per card, so it keeps the PCIe card as its own total.
+  buildCards(hw.gpus);
+  if (splitPcie(hw.gpus)) {
+    (hw.gpus || []).forEach((g, i) => {
+      const gmax = g.pcie_gen_max || g.pcie_gen;
+      setMetric(`pcie${g.index == null ? i : g.index}`, gmax ? `Gen${gmax}` : null, g.pcie_width ? `x${g.pcie_width}` : "",
+                gmax && g.pcie_gen != null && g.pcie_gen < gmax ? `idle Gen${g.pcie_gen}` : "");
+    });
+    const rate = (x) => x >= 1000 ? `${fmt(x / 1024, 2)} GB/s` : `${fmt(x, x < 10 ? 1 : 0)} MB/s`;
+    setMetric("pcie", hw.gpu_pcie_rx_mb == null ? null : fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0),
+              hw.gpu_pcie_rx_mb == null ? "" : "MB/s",
+              hw.gpu_pcie_tx_mb == null ? "" : `to the host ${rate(hw.gpu_pcie_tx_mb)}`);
+  } else {
+    const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+    const rx = hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
+              (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : "");
+    setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "", rx);
+  }
   spark("sp-pcie", h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
