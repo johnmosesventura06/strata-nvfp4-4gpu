@@ -437,6 +437,14 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
+    // STRATA_BATCH_BRANCH=1 (opt-in): a batch window's per-slot work (each slot's GDN conv and recurrence, its K/V and
+    // indexer appends, its block selection and attention, and its commit) on one side stream per slot inside the
+    // graph, so the slots' small kernels run side by side instead of one after another.  Same kernels, same arguments.
+    static constexpr int kSlotBranches = 8;
+    bool sb_on_ = false;
+    cudaStream_t sb_side_[kSlotBranches] = {};
+    cudaEvent_t sb_fork_ = nullptr, sb_mid_ = nullptr;
+    cudaEvent_t sb_join_[kSlotBranches] = {};
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     cudaGraphExec_t commit_exec_ = nullptr;
