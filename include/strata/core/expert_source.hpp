@@ -47,6 +47,9 @@ struct ExpertLayout;
 
 namespace strata::core {
 
+/// Multi-GPU: the most tier GPUs --peer-devices takes (the dispatch's and the prompt path's tables are sized by it).
+inline constexpr int kMaxPeerTiers = 8;
+
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
 struct LoadStats;
@@ -545,11 +548,11 @@ struct ExpertDispatch {
     std::vector<std::pair<int64_t, int32_t>> fetch_log;   ///< (layer * n_expert + expert, slot)
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
-    /// Multi-GPU: the peer GPUs' adaptive expert tiers (up to 3, --peer-devices).  Their experts are computed
+    /// Multi-GPU: the peer GPUs' adaptive expert tiers (up to kMaxPeerTiers, --peer-devices).  Their experts are computed
     /// there instead of on the CPU (kind 2); an entry's tier is the FIRST peer whose cache holds it (peer_of),
     /// the tiers being disjoint by construction (each open excludes the earlier ones, each adapt excludes the
     /// others through the merged residency table).
-    PeerExperts* peers[3] = {};
+    PeerExperts* peers[kMaxPeerTiers] = {};
     int n_peers = 0;
     int64_t peer_entries = 0;      ///< routed entries the tiers served in verify windows
     /// the tier index holding (layer, expert), or -1 when no peer card does.  Defined in expert_source.cpp:
