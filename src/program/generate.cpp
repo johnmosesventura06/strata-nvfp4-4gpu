@@ -9221,6 +9221,8 @@ int main(int argc, char** argv) {
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
+        double bt_pl0[3] = {}, bt_pw0[3] = {}, bt_cpu0 = 0;   // STRATA_PEER_TIMING
+        int64_t bt_pc0[3] = {};
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0;
         Clock::time_point bt_start = Clock::now();
@@ -9358,6 +9360,10 @@ int main(int argc, char** argv) {
             if (bt_windows == 0) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
+                for (int p = 0; p < n_peers; ++p) {
+                    bt_pl0[p] = peers[p].ms_launch; bt_pw0[p] = peers[p].ms_wait; bt_pc0[p] = peers[p].calls;
+                }
+                bt_cpu0 = drive.cpu_ms;
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
             }
             const Clock::time_point w0 = Clock::now();
@@ -9433,6 +9439,19 @@ int main(int argc, char** argv) {
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                              (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
+                static const bool peer_timing = std::getenv("STRATA_PEER_TIMING") != nullptr;
+                if (peer_timing) {
+                    std::string pt;
+                    char b[160];
+                    for (int p = 0; p < n_peers; ++p) {
+                        std::snprintf(b, sizeof b, " | peer %d: %.1f calls, launch %.2f ms, wait %.2f ms", p + 1,
+                                      (double) (peers[p].calls - bt_pc0[p]) / w, (peers[p].ms_launch - bt_pl0[p]) / w,
+                                      (peers[p].ms_wait - bt_pw0[p]) / w);
+                        pt += b;
+                    }
+                    std::fprintf(stderr, "strata batch peer timing (per window): pool dispatch %.2f ms%s\n",
+                                 (drive.cpu_ms - bt_cpu0) / w, pt.c_str());
+                }
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());

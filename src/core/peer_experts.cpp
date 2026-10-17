@@ -193,6 +193,11 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     row_of_.clear();
     const int64_t n = n_tok * k;
     if (n > CAP) { err = "peer experts: window too large"; return false; }
+    const auto t_launch = std::chrono::steady_clock::now();
+    struct LaunchTime {   // STRATA_PEER_TIMING: what launch() costs the host
+        PeerExperts* p; std::chrono::steady_clock::time_point t0;
+        ~LaunchTime() { p->ms_launch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    } launch_time{this, t_launch};
     Meta& m = *(Meta*) h_meta_;
     int groups = 0, rows = 0;
     // distinct experts in routing order; each one's entries become compact rows
@@ -221,6 +226,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     m.start[groups] = rows;
     m.count[0] = groups;
     m.count[1] = rows;
+    ++calls;
     entries_ += rows;
     launched_rows_ = rows;
     // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is

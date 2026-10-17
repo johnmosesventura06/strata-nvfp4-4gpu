@@ -89,6 +89,8 @@ public:
     int64_t experts() const { return experts_; }      ///< distinct (layer, expert) the peer computed
     int64_t swaps() const { return swaps_; }
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
+    double ms_launch = 0;                             ///< host time spent in launch() (plan + copies + kernel launches)
+    int64_t calls = 0;                                ///< launch() calls that gave the peer rows
 
 private:
     int device_ = -1;
