@@ -186,6 +186,9 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.  The fork: on an NVFP4 pack the share's chunks go up to 4096 tokens.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// STRATA_BATCH_CONCURRENT: true keeps every prompt chunk off the CPU expert pool (the batch slots' windows
+    /// use it beside the read); a chunk then reads with the GPUs alone, as when another stage holds the pool
+    static void reserve_cpu_pool(bool on);
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.

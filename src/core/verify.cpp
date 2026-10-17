@@ -409,6 +409,7 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : sb_join_)
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
+    if (ple_scratch_b_) cudaFree(ple_scratch_b_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_bal_};
     for (void* h : hosts)
@@ -652,7 +653,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
+    else if (batch_concurrent_env()) {   // the windows' kernels go first beside a prompt read's
+        int lo = 0, hi = 0;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &hi) != cudaSuccess ||
+            cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, hi) != cudaSuccess) {
+            cudaGetLastError();
+            if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
+        }
+    } else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
     if (cs_ == nullptr || cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
@@ -683,7 +691,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             bool okb = cudaEventCreateWithFlags(&sb_fork_, cudaEventDisableTiming) == cudaSuccess &&
                        cudaEventCreateWithFlags(&sb_mid_, cudaEventDisableTiming) == cudaSuccess;
             for (int i = 0; i < kSlotBranches && okb; ++i)
-                okb = cudaStreamCreateWithFlags(&sb_side_[i], cudaStreamNonBlocking) == cudaSuccess &&
+                okb = [&] {
+                    int lo = 0, hi = 0;
+                    if (batch_concurrent_env() && cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+                        cudaStreamCreateWithPriority(&sb_side_[i], cudaStreamNonBlocking, hi) == cudaSuccess)
+                        return true;
+                    cudaGetLastError();
+                    return cudaStreamCreateWithFlags(&sb_side_[i], cudaStreamNonBlocking) == cudaSuccess;
+                }() &&
                       cudaEventCreateWithFlags(&sb_join_[i], cudaEventDisableTiming) == cudaSuccess;
             if (!okb) { cudaGetLastError(); sb_on_ = false; }
             std::fprintf(stderr, "strata verify: STRATA_BATCH_BRANCH: %s\n",
@@ -919,7 +934,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (ar_on()) wait_flag_ge(m_flag_, 1, cs);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
-            float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
+            void* const ple_scr = batch_rec_ && ple_scratch_b_ != nullptr ? ple_scratch_b_ : ss.ple.scratch;
+            float* normalized = (float*) ((uint8_t*) ple_scr + ple_block_scratch_bytes());
             static const bool ple_batch_env = [] {
                 const char* e = std::getenv("STRATA_PLE_BATCH");
                 return !e || e[0] != '0';
@@ -999,9 +1015,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 try {
                     if (ple_batch_kv) {
                         ple_block_projected(xn_ + (size_t) t * HC * N, z_ + (size_t) t * N, Rt(t), hist,
-                                            ss.ple.w, po, ss.ple.scratch, cs);
+                                            ss.ple.w, po, ple_scr, cs);
                     } else {
-                        ple_block(ple_ + t * N, Rt(t), hist, pw, po, ss.ple.scratch, cs);
+                        ple_block(ple_ + t * N, Rt(t), hist, pw, po, ple_scr, cs);
                     }
                     ple_history_advance(hist, normalized, cs);
                 } catch (const std::exception& e) {
@@ -2517,6 +2533,14 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     arena_b_ = d;
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
+    if (batch_concurrent_env() && ple_scratch_b_ == nullptr &&
+        cudaMalloc(&ple_scratch_b_, strata::kernels::ple_block_scratch_bytes() +
+                                        strata::kernels::NG_HC_DIM * sizeof(float)) != cudaSuccess) {
+        ple_scratch_b_ = nullptr;
+        cudaGetLastError();
+        err = "verify: the batch windows' PLE scratch (STRATA_BATCH_CONCURRENT) does not fit";
+        return false;
+    }
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
