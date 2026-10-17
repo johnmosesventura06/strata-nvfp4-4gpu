@@ -5304,9 +5304,23 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<std::pair<int32_t, int32_t>> cand = profile;
+        // STRATA_PEER_STRIPE=1 (opt-in): deal the ranked pairs the primary does not hold to the tiers in turn (rank r to
+        // tier r mod n), so each tier holds an equal mix of hot and cold experts and computes about the same rows per
+        // layer; without it the first tier takes the hottest band and the others wait on it (measured: tier 1 waited
+        // 3-10x the others).  Disjoint by construction, as the in-order fill.
+        const bool peer_stripe = [] { const char* v = std::getenv("STRATA_PEER_STRIPE"); return v != nullptr && std::atoi(v) != 0; }();
+        std::vector<std::vector<std::pair<int32_t, int32_t>>> stripe(o.peer_devices.size());
+        if (peer_stripe && o.peer_devices.size() > 1) {
+            size_t r = 0;
+            for (const auto& pr : profile)
+                if (xcache.slot_of(pr.first, pr.second) < 0) stripe[r++ % stripe.size()].push_back(pr);
+            std::fprintf(stderr, "strata generate: STRATA_PEER_STRIPE: %zu ranked pairs dealt to %zu tiers in turn\n", r,
+                         stripe.size());
+        }
         for (size_t pi = 0; pi < o.peer_devices.size(); ++pi) {
             const auto tp0 = Clock::now();
-            if (!peers[n_peers].open(o.peer_devices[pi], cand, xcache, *srcp, g.n_layers, g.n_expert,
+            if (!peers[n_peers].open(o.peer_devices[pi], peer_stripe && o.peer_devices.size() > 1 ? stripe[pi] : cand,
+                                     xcache, *srcp, g.n_layers, g.n_expert,
                                      o.peer_reserve_mib, o.peer_slots, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
