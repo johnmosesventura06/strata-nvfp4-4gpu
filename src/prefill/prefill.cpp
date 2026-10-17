@@ -2112,6 +2112,8 @@ struct PeTimer {
     double ms[kPeCount] = {};
     void mark(int phase, cudaStream_t s) {   // the peer device is current
         if (!on) return;
+        int cur = -1;   // several peer GPUs: time the first one only (its events live on its device)
+        if (cudaGetDevice(&cur) != cudaSuccess || cur != dev) return;
         if (used == ev.size()) {
             cudaEvent_t e = nullptr;
             cudaEventCreate(&e);
