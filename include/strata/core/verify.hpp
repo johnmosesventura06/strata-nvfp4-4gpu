@@ -20,6 +20,7 @@
 // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
+#include <cstdlib>
 
 #include <cstdio>
 
@@ -56,6 +57,13 @@ struct VerifyHits {
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
 };
+
+/// STRATA_BATCH_CONCURRENT=1 (opt-in): the batch slots decode on their own thread while a prompt is read, on
+/// high-priority streams (generate.cpp read_part); off: everything as before.
+inline bool batch_concurrent_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_BATCH_CONCURRENT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 
 class Verifier {
 public:
@@ -340,6 +348,8 @@ private:
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
+    void* ple_scratch_b_ = nullptr;        ///< STRATA_BATCH_CONCURRENT: the batch windows' own PLE scratch (the
+                                           ///< prompt path, reading beside them, uses the session's)
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
