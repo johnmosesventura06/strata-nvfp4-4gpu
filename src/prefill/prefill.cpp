@@ -894,6 +894,12 @@ struct Prefill::Impl {
                                              // every m.pp site; the held-expert loop runs over pp_at()/n_pp().
     PeerPrefill* pp_at(int i) const { return i == 0 ? pp.get() : pps[(size_t) (i - 1)].get(); }
     int n_pp() const { return (pp ? 1 : 0) + (int) pps.size(); }
+    // the tier holding (layer, expert), or -1 (the tiers are disjoint: the first holder is the only one)
+    int tier_of(int64_t l, int32_t e) const {
+        for (int i = 0, n = n_pp(); i < n; ++i)
+            if (const PeerPrefill* Q = pp_at(i); Q->peer && Q->peer->has(l, e)) return i;
+        return -1;
+    }
     // P3b-fix: the pinned buffer of 1.0 floats that row_sd fills read from. TWO owners: the CPU experts' rows
     // (they carry s_down already) and every peer tier's returned rows (tiers run with sums off, so the combine
     // must read 1 for their rows too). It used to be allocated only inside the CPU-share block: with the share
@@ -2443,7 +2449,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    if (m.tier_of(l, e) >= 0) continue;   // multi-GPU: computed on (or read from) the tier holding it
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -3318,7 +3324,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<char> on_peer;                     // 0 none, 1 held by its tier, 2 streamed (tier 0's ring)
                         std::vector<int8_t> own_blk;                   // P3b: the tier holding an on_peer==1 expert
                         const int npp = m.n_pp();
-                        std::array<int64_t, 4> rows_blk{};             // P3b: held rows per tier
+                        std::vector<int64_t> rows_blk((size_t) std::max(npp, 1), 0);   // P3b: held rows per tier
                         int64_t rows_str = 0;                          // ...and the streamed rows (tier 0, single tier only)
                         int64_t rows_local = T * K, rows_peer = 0;
                         if (npp > 0 && pre_mmq) {
@@ -3378,7 +3384,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order;
-                        std::array<std::vector<int32_t>, 4> order_blk;   // P3b: each tier's held experts, in id order
+                        std::vector<std::vector<int32_t>> order_blk((size_t) std::max(npp, 1));   // P3b: each tier's held experts, in id order
                         std::vector<int32_t> order_str;                  // ...and the streamed ones (tier 0's second block)
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
                             if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] == 0) &&
@@ -4129,7 +4135,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                     const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
-                                                           : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);   // over the cap: P2P
+                                                           : (m.tier_of(l, e) >= 0 ? m.pp_at(m.tier_of(l, e))->peer->slot_ptr(l, e)
+                                                                                   : nullptr);   // over the cap: P2P
                                     if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
                                     ++stats_.experts_resident;
                                     if (!compute(j, bp, -1)) return false;

@@ -857,7 +857,7 @@ void usage() {
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
-                  "  --peer-devices LIST  up to 3 tier GPUs, comma-separated (e.g. 1,2,3): the tiers are disjoint\n"
+                  "  --peer-devices LIST  up to 8 tier GPUs, comma-separated (e.g. 1,2,3): the tiers are disjoint\n"
                   "                       (each holds what the primary and the earlier ones do not) and each adapts\n"
                   "                       beside the others' holdings.  Each also computes its held experts' prompt\n"
                   "                       rows (--peer-prefill-rows, split across them); the streamed ring and the\n"
@@ -2121,9 +2121,9 @@ int main(int argc, char** argv) {
     }
     // multi-tier: --peer-device N is a one-device list; a list also sets the legacy accessor to its first device
     if (o.peer_device >= 1 && o.peer_devices.empty()) o.peer_devices.push_back(o.peer_device);
-    if (o.peer_devices.size() > 3) {
-        std::fprintf(stderr, "strata generate: --peer-devices takes at most 3 devices (got %zu)\n",
-                     o.peer_devices.size());
+    if (o.peer_devices.size() > (size_t) strata::core::kMaxPeerTiers) {
+        std::fprintf(stderr, "strata generate: --peer-devices takes at most %d devices (got %zu)\n",
+                     strata::core::kMaxPeerTiers, o.peer_devices.size());
         return 2;
     }
     if (!o.peer_devices.empty()) o.peer_device = o.peer_devices.front();
@@ -4398,7 +4398,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --head-split needs --peer-devices and --spec >= 2 (verify windows)\n");
             return 1;
         }
-        const int sh_parts = (int) std::min<size_t>(o.peer_devices.size(), (size_t) 3);
+        const int sh_parts = (int) std::min<size_t>(o.peer_devices.size(), (size_t) strata::core::kMaxPeerTiers);
         const int64_t split0 = (int64_t) ((1.0 - o.head_split) * (double) n_vocab) / 256 * 256;
         const int64_t per = split0 > 0 ? (n_vocab - split0) / sh_parts / 256 * 256 : 0;
         int main_dev = 0;
@@ -5292,7 +5292,7 @@ int main(int argc, char** argv) {
     // multi-tier: one PeerExperts per --peer-devices entry, opened in list order.  Each open takes the ranked
     // pairs the primary does not hold, as many as fit; the list handed to the NEXT tier is filtered to exclude
     // what this tier took, so the tiers are disjoint by construction (their adapts keep it so, below).
-    strata::core::PeerExperts peers[3];
+    strata::core::PeerExperts peers[strata::core::kMaxPeerTiers];
     int n_peers = 0;
     auto any_peer_has = [&](int64_t l, int32_t e) -> bool {
         for (int p = 0; p < n_peers; ++p) if (peers[p].has(l, e)) return true;
@@ -7027,7 +7027,7 @@ int main(int argc, char** argv) {
         }
         if (n_peers > 0 && o.peer_prefill_rows != 0) {   // P3b: every tier computes its held experts' prompt rows
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            strata::core::PeerExperts* parr[3];
+            strata::core::PeerExperts* parr[strata::core::kMaxPeerTiers];
             for (int p = 0; p < n_peers; ++p) parr[p] = &peers[p];
             if (!sp.set_peers(parr, n_peers, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
