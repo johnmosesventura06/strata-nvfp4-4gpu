@@ -1881,6 +1881,7 @@ std::unique_ptr<PeerPrefill> Prefill::make_pp(core::PeerExperts* peer, int64_t c
     }
     if (ok && pp->p2p && pp->sums) {   // tier sums: the rows' pairs and the gather tables are built on the host
         ok = cudaHostAlloc((void**) &pp->host_pair, (size_t) pp->cap_rows * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+             cudaHostAlloc((void**) &pp->host_x16, (size_t) m.T_max * N * 2, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
              (!pp->gather ||
               cudaHostAlloc((void**) &pp->host_adds, pp->adds_cap * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess);
         if (!ok) cudaGetLastError();
@@ -3605,6 +3606,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         // multi-GPU: each tier's block, enqueued before the primary's own experts so the cards work at once
                         peer_now = use_mmq && !blks.empty();
+                        // tier sums: the layer's activations go out ONCE, in FP16, to mapped host memory, and every tier
+                        // reads them over its own link (a P2P copy per tier sends T x N x 4 bytes through the primary's
+                        // link once for each tier).  STRATA_PF_TIER_X16=0: the P2P copies.
+                        static const bool tier_x16_env = [] { const char* v = std::getenv("STRATA_PF_TIER_X16"); return v == nullptr || std::atoi(v) != 0; }();
+                        const uint16_t* tier_x16 = peer_now && tier_x16_env && m.pp->sums && m.pp->p2p ? m.pp->host_x16 : nullptr;
+                        if (tier_x16 != nullptr)
+                            cudaMemcpyAsync(m.pp->host_x16, m.mixed_h, (size_t) T * N * 2, cudaMemcpyDeviceToHost, m.cs);
                         for (auto& B : blks) {   // P3b: one block per tier (single tier: one block, exactly as before)
                             if (!peer_now) break;
                             PeerPrefill& P = *B.P;
@@ -3634,7 +3642,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaStreamWaitEvent(ps, P.ev_in, 0);
                             if (P.out_pending) { cudaStreamWaitEvent(ps, P.ev_done, 0); P.out_pending = false; }
                             pe.mark(kPeMoeIn, ps);
-                            if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
+                            if (tier_x16 != nullptr) f16_to_f32_wide(P.mixed, tier_x16, T * N, ps);
+                            else if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
                             else if (P.f16) f16_to_f32_wide(P.mixed, P.host_x16, T * N, ps);
                             else copy_f32_wide(P.mixed, P.host_x, T * N, ps);
                             P.back_at = rows_local;
