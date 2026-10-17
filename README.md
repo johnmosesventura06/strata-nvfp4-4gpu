@@ -7,6 +7,57 @@ cards, the output head split across all of them, tier prefill, NVMe session jour
 support. Measured on a 4× RTX 5060 Ti 16 GB rig and a mixed RTX 3090 + 3× 5060 Ti rig (9950X, 128 GB DDR5-5000,
 driver 615.71.09 with the consumer-P2P patch, CUDA 13.3, Linux).
 
+## What's new (October 2026): concurrency and the multi-tier prompt path
+
+Measured on the production rig (RTX 3090 trunk + 3× RTX 5060 Ti tiers), same session, the build with items 1-2
+against the build with all six:
+
+| | items 1-2 | all six |
+|---|---|---|
+| 16K-token prompt, time to first token | 14.3 s | **9.35 s** |
+| 30K-token prompt, time to first token | 16.4 s | **11.6 s** |
+| one 6,144-token prompt chunk on the trunk | 3.55 s (~1,730 tok/s) | **2.35 s (~2,600 tok/s)** |
+| 1K prompts, aggregate decode, 1 / 2 / 3 clients | 81 / 94 / 102 tok/s | **91 / 98 / 119 tok/s** |
+| 1K prompts, first token with 3 clients | 3.4 s | **2.2 s** |
+| a client decoding while another client's 16K prompt is read | 35 tok/s (prompt first token 18.5 s) | **41 tok/s** (prompt first token **15.7 s**) |
+| tier GPUs supported | 3 | **8** (a 3090 + 4× 5060 Ti fleet needs only `--peer-devices 1,2,3,4`) |
+
+Prompt-path accuracy: the first-token logits after five prompts of 1.5K-30K tokens sit at KL 0.8-2.2 × 10⁻³ from
+the previous build, with the same top token in 5 of 5 (the previous build against itself: 0).
+
+**1. Batch slots branch inside the verify window** (`STRATA_BATCH_BRANCH=1`). With several clients, each slot's own
+work in a window (GDN convolution and recurrence, the QSA KV append, scores, top-k and attention, and each slot's
+commit chain) runs on its own stream inside the captured graph, forked and joined around the shared work, instead
+of one slot after another. 3-slot window 28.7 → 26.9 ms, 3 clients 96.5 → 101.8 tok/s aggregate; token-identical
+to the serial graph.
+
+**2. Decode keeps running while a prompt is read** (`STRATA_BATCH_CONCURRENT=1`, `STRATA_BATCH_CONC_SHARE`). The
+batch slots used to stop for the whole of a long prompt and get only a slice between chunks. Now they decode on
+their own thread, on high-priority streams, beside the prompt chunks; `STRATA_BATCH_CONC_SHARE` (0.75 in the
+config of record) adds an exclusive decode slice after each chunk. It engages for prompts longer than one chunk.
+A client decoding while a 16K prompt is read: 25.7 → 33.7 tok/s, and the prompt's first token 19.3 → 17.8 s.
+
+**3. Tiers no longer make the trunk copy their experts.** With several tiers, the prompt path's expert stream
+skipped only the first tier's experts, so the trunk copied every expert of tiers 2 and 3 over its own PCIe link on
+every chunk and threw them away. Fixing it is what makes `STRATA_PREFILL_CPU_SHARE_MAX=1024` (stream every
+non-resident expert during the attention half) the fast setting again; the old config pinned 6145 to dodge it.
+
+**4. Every tier streams its own share of the missing experts** (`STRATA_PF_TIER_STREAM`, default 1/(tiers+1)
+each). Experts no card holds are copied from pinned RAM by the trunk and by every tier, each over its own link and
+into its own ring, and computed where they land.
+
+**5. Tiers send back one FP16 sum per token** (`STRATA_PF_TIER_SUMS`, on with two or more tiers). Instead of one
+result row per routed expert (~18 GB a chunk through the trunk's x8 link), each tier adds its rows into a
+weighted per-token sum and copies that over P2P (~4× less); a new combine kernel (`moe_combine_tiers16`) adds
+the trunk's own rows and every tier's sum.
+
+**6. The activations go out once** (`STRATA_PF_TIER_X16`, on with tier sums). The trunk writes each layer's MoE
+input once, in FP16, to mapped host memory and every tier reads it over its own link, instead of one FP32 P2P copy
+per tier through the trunk's link.
+
+The prompt path also gained a working `STRATA_PREFILL_TIMING=1` with several tiers (the per-phase breakdown that
+found items 3-6).
+
 ## What this fork adds
 
 - **Peer expert tiers** — each peer card holds ~5,500-8,500 experts in its own VRAM and computes their rows
@@ -31,8 +82,11 @@ driver 615.71.09 with the consumer-P2P patch, CUDA 13.3, Linux).
 |---|---|---|---|
 | 4× 5060 Ti 16 GB | 1,846-1,891 @14.5-54K prompt, 1,723-1,739 @195-212K | 94-113 | flat depth curve 14K→212K |
 | 3090 trunk + 3× 5060 Ti (np3) | ~1,250-1,300 @3K, ~1,670 @57K | **132 solo** | trunk must sit on x8; peers fine on x4 |
+| 3090 trunk + 3× 5060 Ti (np3), Oct 2026 build | **~2,600 per 6,144-token chunk**; 16K prompt 9.35 s, 30K 11.6 s | 117-121 solo | multi-tier prompt path, see *What's new* |
 
 Concurrency on the np3 shape: 2 streams ~56-79 t/s each (~135 aggregate), 3 streams ~36-58 each (~139 aggregate).
+(The October 2026 numbers in *What's new* use the `conc_bench` 1K-prompt shape, a different workload: 91 / 98 / 119
+aggregate at 1 / 2 / 3 clients.)
 The aggregate ceiling is the 3090 trunk and it is already saturated at two streams, so the third slot is nearly
 free; its cost is expert cache (4,632 → ~3,150 slots, fleet residency 85.6% → ~80%). For comparison, the vLLM
 golden lane on the same rig runs ~40 t/s per stream at two concurrent requests — strata's fan-out scales
@@ -54,7 +108,8 @@ NVFP4 (`qwen-nvidia-nvfp4`) is the alternative if you prefer their quantizer.
 ## Requirements
 
 - **GPUs:** four NVIDIA cards, 16 GB each (RTX 5060 Ti 16 GB reference build) — or a mixed fleet with one
-  24 GB RTX 3090/4090 as trunk (x8 slot required; peers may sit on x4). Blackwell cards run the FP4 native
+  24 GB RTX 3090/4090 as trunk (x8 slot required; peers may sit on x4). Up to 8 tier cards beside the trunk
+  (`--peer-devices`); the multi-tier prompt path was validated with 2 and 3 tiers. Blackwell cards run the FP4 native
   expert path; an Ampere trunk runs the sm_86 path (see the mixed-fleet doc). Driver 580+ (this rig:
   615.71.09 with the consumer-P2P kernel patch), CUDA 13.3, Linux. Without the P2P patch everything still
   runs over host-mapped transport — correct, slower.
@@ -77,9 +132,21 @@ START-HERE.bat        (Linux: ./setup.sh)
 Setup checks the PC, installs the engine and the model pack, and starts the server on `http://127.0.0.1:8080`.
 For the multi-GPU fleet shapes, boot with `configs/nvfp4-512k-np2-vision.json` (production: np3, 512K context,
 head split 0.7515, tier prefill, disk journal, `--conversation-cache-mib 0`) or `configs/np4-262k.json`
-(np4 concurrency shape at 262K). Every engine env flag is documented in [.env.example](.env.example).
-Multi-GPU P2P needs the consumer-P2P kernel patch; without it the engine still runs, falling back to
-host-mapped transport (correct, slower).
+(np4 concurrency shape at 262K). Multi-GPU P2P needs the consumer-P2P kernel patch; without it the engine
+still runs, falling back to host-mapped transport (correct, slower).
+
+### Engine flags added in October 2026
+
+| flag | config of record | what it does |
+|---|---|---|
+| `STRATA_BATCH_BRANCH` | `1` | batch slots' own work on their own streams inside the verify-window graph |
+| `STRATA_BATCH_CONCURRENT` | `1` | the batch slots decode on their own thread while a prompt longer than one chunk is read |
+| `STRATA_BATCH_CONC_SHARE` | `0.75` | exclusive decode time after each prompt chunk, as a fraction of the chunk's time |
+| `STRATA_PREFILL_CPU_SHARE_MAX` | `1024` | chunks from this size up stream every non-resident expert during the attention half |
+| `STRATA_PF_TIER_STREAM` | unset (1/(tiers+1)) | each tier's share of the streamed experts (`0`: tiers compute only the experts they hold) |
+| `STRATA_PF_TIER_SUMS` | unset (on) | tiers send one FP16 sum per token back (`0`: their result rows) |
+| `STRATA_PF_TIER_X16` | unset (on) | activations go out once in FP16 through host memory (`0`: one P2P copy per tier) |
+| `STRATA_PREFILL_TIMING` | unset | `1`: per-phase GPU timeline of each prompt read, trunk and first tier |
 
 ## Docs
 
