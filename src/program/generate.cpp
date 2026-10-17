@@ -9214,6 +9214,10 @@ int main(int argc, char** argv) {
             bool partial = false, partial_from0 = false;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // STRATA_BATCH_CONCURRENT=1: the slots decode on their own thread while a prompt is read (read_part):
+        // `bs_mu` guards the slots then, and the adaptive tier's swaps wait until the read is done (`conc_read`)
+        std::mutex bs_mu;
+        std::atomic<bool> conc_read{false};
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -9313,6 +9317,7 @@ int main(int argc, char** argv) {
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
+            std::string err;   // its own: beside a prompt read (STRATA_BATCH_CONCURRENT) the read owns the outer one
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
@@ -9349,7 +9354,7 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            apply_pending(false);
+            if (!conc_read.load(std::memory_order_acquire)) apply_pending(false);   // not under a prompt read's feet
             if (bt_windows == 0) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
@@ -10742,6 +10747,54 @@ int main(int argc, char** argv) {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                // STRATA_BATCH_CONCURRENT=1: the slots decode on their own thread for the whole read (their windows
+                // on high-priority streams, the GPU's scheduler runs them between the chunk's kernels) instead of
+                // between its chunks; the chunks then leave the CPU expert pool to the windows
+                std::thread cd_th;
+                std::atomic<bool> cd_stop{false}, cd_fail{false};
+                auto cd_start = [&]() {
+                    // only a read of more than one chunk: a shorter one is over in about a chunk's time, and the slots
+                    // waiting for it costs them less than slowing it down beside them (measured: 2 clients -16%)
+                    if (!strata::core::batch_concurrent_env() || cd_th.joinable() || !stages.empty() || b0 - a0 <= C) return;
+                    {
+                        std::lock_guard<std::mutex> lk(bs_mu);
+                        if (!batch_on()) return;
+                    }
+                    cd_stop.store(false);
+                    conc_read.store(true, std::memory_order_release);
+                    strata::prefill::Prefill::reserve_cpu_pool(true);
+                    cd_th = std::thread([&]() {
+                        cudaSetDevice(0);
+                        while (!cd_stop.load(std::memory_order_acquire)) {
+                            std::unique_lock<std::mutex> lk(bs_mu);
+                            if (!batch_on()) {
+                                lk.unlock();
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                                continue;
+                            }
+                            if (!batch_step()) {
+                                cd_fail.store(true);
+                                return;
+                            }
+                        }
+                    });
+                };
+                auto cd_join = [&]() {
+                    if (!cd_th.joinable()) return;
+                    cd_stop.store(true, std::memory_order_release);
+                    cd_th.join();
+                    strata::prefill::Prefill::reserve_cpu_pool(false);
+                    conc_read.store(false, std::memory_order_release);
+                };
+                struct CdGuard {
+                    std::function<void()> f;
+                    ~CdGuard() { f(); }
+                } cd_guard{cd_join};
+                cd_start();
+                if (cd_th.joinable()) {
+                    std::fprintf(stderr, "strata batch: the slots decode beside this prompt read (STRATA_BATCH_CONCURRENT)\n");
+                    ++il_parts;
+                }
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + C);
                     const auto tq = Clock::now();
@@ -10754,7 +10807,10 @@ int main(int argc, char** argv) {
                         for (auto it = in_lines.begin(); it != in_lines.end();) {
                             if (it->rfind("BSTOP ", 0) == 0) {
                                 const int b = std::atoi(it->c_str() + 6);
-                                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                if (b >= 0 && b < (int) bs.size()) {
+                                    std::lock_guard<std::mutex> bl(bs_mu);
+                                    bs[(size_t) b].stop = true;
+                                }
                                 it = in_lines.erase(it);
                             } else if (it->rfind("BYIELD ", 0) == 0) {
                                 ys = std::atoi(it->c_str() + 7);
@@ -10765,6 +10821,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (ys >= 0) {
+                        cd_join();   // the slots' sessions stay still while one of them takes the part read
                         // only where the rest is read the same way after it (more than a chunk and more than a short
                         // read left), text only, and into a slot that is not decoding
                         const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
@@ -10796,6 +10853,20 @@ int main(int argc, char** argv) {
                         if (can) bs[(size_t) ys].cached = false;   // half written
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
+                        cd_start();
+                    }
+                    if (cd_fail.load()) { batch_fatal = true; e = "a batch window failed"; return false; }
+                    if (cd_th.joinable()) {   // they decode on their own thread
+                        // STRATA_BATCH_CONC_SHARE (default 0): and alone for this share of the chunk's time - the read
+                        // waits, so their windows have the GPU to themselves (beside a chunk they wait for its kernels)
+                        static const double conc_share = [] {
+                            const char* v = std::getenv("STRATA_BATCH_CONC_SHARE");
+                            return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+                        }();
+                        if (conc_share > 0.0)
+                            std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(
+                                conc_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count()));
+                        continue;
                     }
                     if (decode_share <= 0.0 || !batch_on()) continue;
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
@@ -10811,6 +10882,8 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
+                cd_join();
+                if (cd_fail.load()) { batch_fatal = true; e = "a batch window failed"; return false; }
                 return true;
             };
             apply_pending(true);
