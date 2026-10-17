@@ -107,6 +107,13 @@ void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk,
 /// moe_combine_peer with the peer's sums in FP16 (`peer16`, may be mapped host memory)
 void moe_combine_peer16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
                         const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream);
+/// Several tiers over P2P (STRATA_PF_TIER_SUMS): the primary's rows below rows_local (k order, row_sd applied as
+/// moe_combine applies it) + the n_sums tiers' FP16 per-token sums (device memory on this GPU), in tier order.
+inline constexpr int kTierSumsMax = 8;
+struct TierSums16 { const uint16_t* p[kTierSumsMax]; int n; };
+void moe_combine_tiers16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                         const float* row_sd, const uint16_t* const* sums, int n_sums, int64_t rows_local, float* bo,
+                         int64_t T, void* stream);
 /// y = FP16 bits of x, saturated at +-65504 (the peer's sums on their way back; eddoursul/Strata 2acfac4)
 void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
 /// dst[0, n) = FP32 of the FP16 src[0, n) (n a multiple of 8, 16-byte aligned; src may be mapped host memory)

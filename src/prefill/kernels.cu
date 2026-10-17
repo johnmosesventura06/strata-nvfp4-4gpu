@@ -2442,6 +2442,27 @@ __global__ void moe_combine_peer16_kernel(const float* __restrict__ Dm, const in
     }
     bo[i] = (s + __half2float(__ushort_as_half(peer16[i]))) + shared[i] * sigm(sg[t]);
 }
+// tier sums: the primary's own rows (k order, s_down applied as moe_combine_kernel does) plus every tier's FP16
+// per-token sum, in tier order
+__global__ void moe_combine_tiers16_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                           const float* __restrict__ w, const float* __restrict__ shared,
+                                           const float* __restrict__ sg, const float* __restrict__ row_sd,
+                                           TierSums16 ts, int64_t rows_local, float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int64_t r = slot[t * 10 + k];
+        if (r >= rows_local) continue;
+        const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];
+        s = fmaf(w[t * 10 + k], v, s);
+    }
+    float p = 0.0f;
+    for (int j = 0; j < ts.n; ++j) p += __half2float(__ushort_as_half(ts.p[j][i]));
+    bo[i] = (s + p) + shared[i] * sigm(sg[t]);
+}
 __global__ void peer_gather_add_kernel(float* __restrict__ sum, const float* __restrict__ rows, int64_t r0,
                                        const float* __restrict__ wk, const int32_t* __restrict__ pair,
                                        const int32_t* __restrict__ tok, const int32_t* __restrict__ start,
@@ -2476,6 +2497,16 @@ void moe_combine_peer16(const float* Dm, const int32_t* slot, const float* w, co
     moe_combine_peer16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, peer16,
                                                                                       rows_local, bo, T);
     check("moe_combine_peer16");
+}
+void moe_combine_tiers16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                         const float* row_sd, const uint16_t* const* sums, int n_sums, int64_t rows_local, float* bo,
+                         int64_t T, void* stream) {
+    TierSums16 ts{};
+    ts.n = n_sums < 0 ? 0 : (n_sums > kTierSumsMax ? kTierSumsMax : n_sums);
+    for (int j = 0; j < ts.n; ++j) ts.p[j] = sums[j];
+    moe_combine_tiers16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, row_sd, ts,
+                                                                                       rows_local, bo, T);
+    check("moe_combine_tiers16");
 }
 void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk, const int32_t* pair, const int32_t* tok,
                      const int32_t* start, const int32_t* list, int64_t n_tok, void* stream) {
