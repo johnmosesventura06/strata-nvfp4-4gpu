@@ -208,7 +208,7 @@ private:
     /// `sums_ok` the sums route - both only for a single share; with several tiers each computes its held experts
     /// and returns plain row blocks.  Null on refusal, `err` set.
     std::unique_ptr<PeerPrefill> make_pp(core::PeerExperts* peer, int64_t cap_rows, bool stream_ok, bool sums_ok,
-                                         std::string& err);
+                                         std::string& err, int n_tiers = 1);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
