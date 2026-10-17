@@ -1815,10 +1815,11 @@ std::unique_ptr<PeerPrefill> Prefill::make_pp(core::PeerExperts* peer, int64_t c
         // P3b: the sums route and the streamed ring belong to a single share (set_peers gates them)
         pp->sums = sums_ok && (v == nullptr || std::atoi(v) != 0);
     }
-    // TIER SUMS (STRATA_PF_TIER_SUMS=1, several tiers over P2P): each tier adds its rows into one FP16 sum per token
-    // and copies that to the primary (T x N x 2 bytes a layer) instead of its rows (rows x N x 4, ~4x more): the
+    // TIER SUMS (default with several tiers over P2P; STRATA_PF_TIER_SUMS=0: the rows come back): each tier adds its rows into one FP16 sum per token
+    // and copies that to the primary (T x N x 2 bytes a layer) instead of its rows (rows x N x 4, ~4x more; KL against the rows ~1e-3, the
+    // same as the stream path itself moves it): the
     // rows of every tier otherwise come back through the primary's one link, beside its expert stream
-    const bool tier_sums = [] { const char* v = std::getenv("STRATA_PF_TIER_SUMS"); return v != nullptr && std::atoi(v) != 0; }();
+    const bool tier_sums = [] { const char* v = std::getenv("STRATA_PF_TIER_SUMS"); return v == nullptr || std::atoi(v) != 0; }();
     if (pp->p2p && pp->compact && n_tiers > 1 && tier_sums && N % 8 == 0) pp->sums = true;
     if (pp->sums) {
         const char* v = std::getenv("STRATA_PF_PEER_F16");
