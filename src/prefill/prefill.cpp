@@ -726,6 +726,7 @@ struct PeerPrefill {
     float *sum = nullptr, *wk = nullptr;
     int32_t* pair = nullptr;
     float *host_w = nullptr, *host_sum = nullptr;
+    uint16_t* sum16_pri = nullptr;        // tier sums over P2P: this tier's FP16 sums, landed on the primary
     int32_t* host_pair = nullptr;
     std::vector<int32_t> bounds_host;
     std::vector<void*> owned;
@@ -762,6 +763,7 @@ struct PeerPrefill {
         if (host_x16) cudaFreeHost(host_x16);
         if (host_sum16) cudaFreeHost(host_sum16);
         if (host_adds) cudaFreeHost(host_adds);
+        if (sum16_pri) cudaFree(sum16_pri);
     }
 };
 
@@ -1813,9 +1815,14 @@ std::unique_ptr<PeerPrefill> Prefill::make_pp(core::PeerExperts* peer, int64_t c
         // P3b: the sums route and the streamed ring belong to a single share (set_peers gates them)
         pp->sums = sums_ok && (v == nullptr || std::atoi(v) != 0);
     }
+    // TIER SUMS (STRATA_PF_TIER_SUMS=1, several tiers over P2P): each tier adds its rows into one FP16 sum per token
+    // and copies that to the primary (T x N x 2 bytes a layer) instead of its rows (rows x N x 4, ~4x more): the
+    // rows of every tier otherwise come back through the primary's one link, beside its expert stream
+    const bool tier_sums = [] { const char* v = std::getenv("STRATA_PF_TIER_SUMS"); return v != nullptr && std::atoi(v) != 0; }();
+    if (pp->p2p && pp->compact && n_tiers > 1 && tier_sums && N % 8 == 0) pp->sums = true;
     if (pp->sums) {
         const char* v = std::getenv("STRATA_PF_PEER_F16");
-        pp->f16 = (v == nullptr || std::atoi(v) != 0) && N % 8 == 0;
+        pp->f16 = ((v == nullptr || std::atoi(v) != 0) || pp->p2p) && N % 8 == 0;   // tier sums: always FP16
         if (pp->f16) pp->sum16 = (uint16_t*) take((size_t) m.T_max * N * 2);
         const char* gv = std::getenv("STRATA_PF_PEER_GATHER");
         pp->gather = gv == nullptr || std::atoi(gv) != 0;
@@ -1872,13 +1879,24 @@ std::unique_ptr<PeerPrefill> Prefill::make_pp(core::PeerExperts* peer, int64_t c
             return nullptr;
         }
     }
+    if (ok && pp->p2p && pp->sums) {   // tier sums: the rows' pairs and the gather tables are built on the host
+        ok = cudaHostAlloc((void**) &pp->host_pair, (size_t) pp->cap_rows * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+             (!pp->gather ||
+              cudaHostAlloc((void**) &pp->host_adds, pp->adds_cap * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess);
+        if (!ok) cudaGetLastError();
+    }
     size_t fb = 0, tb = 0;
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(prev);
+    if (ok && pp->p2p && pp->sums && cudaMalloc((void**) &pp->sum16_pri, (size_t) m.T_max * N * 2) != cudaSuccess) {
+        cudaGetLastError();
+        ok = false;
+    }
     if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return nullptr; }
     std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
                          "layer%s%s); %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
-                 pp->p2p ? "" : (pp->sums ? (pp->f16 ? ", no P2P: through mapped host memory in FP16, one weighted sum per token back"
+                 pp->p2p ? (pp->sums ? ", one FP16 weighted sum per token back over P2P" : "")
+                         : (pp->sums ? (pp->f16 ? ", no P2P: through mapped host memory in FP16, one weighted sum per token back"
                                                      : ", no P2P: through mapped host memory, one weighted sum per token back")
                                           : ", no P2P: through mapped host memory"),
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
@@ -3603,9 +3621,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (!P.p2p && P.f16) cudaMemcpyAsync(P.host_x16, m.mixed_h, (size_t) T * N * 2, cudaMemcpyDeviceToHost, xs);
                             else if (!P.p2p) cudaMemcpyAsync(P.host_x, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, xs);
                             if (P.sums) {   // the routing weights, and each peer row's routed pair (t * K + k)
-                                cudaMemcpyAsync(P.host_w, m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, xs);
-                                for (int64_t i = 0; i < T * K; ++i)
-                                    if (const int32_t r = slot_h[(size_t) i]; r >= rows_local) P.host_pair[r - rows_local] = (int32_t) i;
+                                if (!P.p2p) cudaMemcpyAsync(P.host_w, m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, xs);
+                                for (int64_t i = 0; i < T * K; ++i)   // (only this block's rows: other tiers follow it)
+                                    if (const int32_t r = slot_h[(size_t) i]; r >= rows_local && r < rows_local + rows_peer)
+                                        P.host_pair[r - rows_local] = (int32_t) i;
                             }
                             cudaEventRecord(P.ev_in, xs);
                             int prevd = 0;
@@ -3629,7 +3648,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             const size_t n = order_peer.size();
                             if (P.sums) {
-                                copy_f32_wide(P.wk, P.host_w, T * K, ps);
+                                if (P.p2p) cudaMemcpyPeerAsync(P.wk, P.dev, m.w, prevd, (size_t) T * K * 4, ps);
+                                else copy_f32_wide(P.wk, P.host_w, T * K, ps);
                                 copy_i32(P.pair, P.host_pair, rows_peer, ps);
                                 cudaMemsetAsync(P.sum, 0, (size_t) T * N * 4, ps);
                             }
@@ -3856,7 +3876,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (P.sums) {   // the sums go back: T x N
                                 if (P.f16) {
                                     sums_to_f16(P.sum, P.sum16, T * N, ps);
-                                    cudaMemcpyAsync(P.host_sum16, P.sum16, (size_t) T * N * 2, cudaMemcpyDeviceToHost, ps);
+                                    if (P.p2p)   // tier sums: straight into the primary's buffer for this tier
+                                        cudaMemcpyPeerAsync(P.sum16_pri, prevd, P.sum16, P.dev, (size_t) T * N * 2, ps);
+                                    else
+                                        cudaMemcpyAsync(P.host_sum16, P.sum16, (size_t) T * N * 2, cudaMemcpyDeviceToHost, ps);
                                 } else {
                                     cudaMemcpyAsync(P.host_sum, P.sum, (size_t) T * N * 4, cudaMemcpyDeviceToHost, ps);
                                 }
@@ -4230,6 +4253,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }();
                     static const bool combine_dbg = std::getenv("STRATA_DBG_NAN") != nullptr;   // it reads bo
                     const bool peer_sums = peer_now && m.pp->sums;
+                    const bool tier_sums_l = peer_sums && m.pp->p2p;   // several tiers' FP16 sums on this GPU
                     if (combine_write_env && !combine_dbg && !peer_sums && half == 1 && !strata::kernels::cvec().covers(l) &&
                         !gr_unfused() && l + 1 < LE && !(l + 1 == 1 && ple_on)) {
                         const core::LayerView vn(*m.wt, l + 1);
@@ -4240,6 +4264,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                               m.xn16_lo, ldx);
                     }
                     if (moe_wrote) {
+                    } else if (tier_sums_l) {
+                        const uint16_t* sp[kTierSumsMax];
+                        int ns = 0;
+                        for (const auto& B : blks)
+                            if (ns < kTierSumsMax) sp[ns++] = B.P->sum16_pri;
+                        moe_combine_tiers16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, row_sd_l, sp, ns, blks.front().at, m.bo, T,
+                                            m.cs);
                     } else if (peer_sums && m.pp->f16)
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_sums)
