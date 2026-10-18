@@ -55,6 +55,18 @@ the trunk's own rows and every tier's sum.
 input once, in FP16, to mapped host memory and every tier reads it over its own link, instead of one FP32 P2P copy
 per tier through the trunk's link.
 
+**7. Steady RAM with the conversation journal** (`STRATA_CONV_POOL_MIB`, 4096 in the config of record). Free RAM
+used to fall through the day of 3-slot use (16 → 11 → 7 GB available) while the pinned K/V copy stayed the same
+27.4 GB. The growth was the malloc heap. Every slot switch builds the whole parked conversation in RAM (up to
+5 GB), writes it to the NVMe journal and frees it, and a mount reads one back the same way. glibc served those
+16 MiB pieces from its heap and kept the freed memory: 6.7 GB after 13 hours (1,350 parks, 985 mounts),
+measured with `malloc_trim` on the live engine. The images now come from a fixed pool of 16 MiB blocks, reserved
+once at start and reused by every park and mount. Anything beyond the pool is mapped and returned to the kernel
+when freed. Available RAM starts about 4 GB lower (the pool is paid up front) and stays there: over 35 parks and
+30 mounts of 18K-token conversations the engine grew 0.17 GB, and an 18K park takes 284 ms (median, was 381 ms).
+Decode, prompt and concurrency benches are unchanged (16K first token 9.26 s; 1K prompts, 2 / 3 clients 107 / 121
+tok/s aggregate; solo decode 119-125 tok/s; a client decoding beside a 16K prompt 40 tok/s).
+
 The prompt path also gained a working `STRATA_PREFILL_TIMING=1` with several tiers (the per-phase breakdown that
 found items 3-6).
 
@@ -146,6 +158,7 @@ still runs, falling back to host-mapped transport (correct, slower).
 | `STRATA_PF_TIER_STREAM` | unset (1/(tiers+1)) | each tier's share of the streamed experts (`0`: tiers compute only the experts they hold) |
 | `STRATA_PF_TIER_SUMS` | unset (on) | tiers send one FP16 sum per token back (`0`: their result rows) |
 | `STRATA_PF_TIER_X16` | unset (on) | activations go out once in FP16 through host memory (`0`: one P2P copy per tier) |
+| `STRATA_CONV_POOL_MIB` | `4096` | fixed RAM pool (MiB) for parked/mounted conversation images; beyond it images are mapped and returned on free (`0`: no pool) |
 | `STRATA_PREFILL_TIMING` | unset | `1`: per-phase GPU timeline of each prompt read, trunk and first tier |
 
 ## Docs
