@@ -61,6 +61,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/core/conversation_pool.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -7643,6 +7644,13 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "strata serve: conversation journal: %zu conversation(s) indexed on disk (%s)\n",
                          journal_index.size(), conversations.enabled() ? "RAM cache on" : "disk-direct mode, RAM cache off");
+            {   // the fixed RAM every park and mount reuses (conversation_pool.hpp); larger images map and unmap
+                const auto t0p = Clock::now();
+                const size_t pool = strata::core::conv_pool::reserve();
+                std::fprintf(stderr, "strata serve: conversation RAM pool: %zu MiB reserved in %.0f ms, reused by every park and "
+                                     "mount; beyond it images are mapped and returned on free (STRATA_CONV_POOL_MIB)\n",
+                             pool >> 20, std::chrono::duration<double, std::milli>(Clock::now() - t0p).count());
+            }
             if (conversations.enabled())
             for (auto& [mt, path] : fs) {
                 strata::core::SavedConversation img;

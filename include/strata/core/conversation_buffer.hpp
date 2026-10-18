@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "strata/core/conversation_pool.hpp"
+
 namespace strata::core {
 
 // Snapshot-owned host storage. Appending never relocates existing payloads;
@@ -119,7 +121,8 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    // segments live in conv_pool (fixed pool or kernel mappings), never the malloc heap: see conversation_pool.hpp
+    using Segment = std::vector<uint8_t, conv_pool::Allocator<uint8_t>>;
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.
