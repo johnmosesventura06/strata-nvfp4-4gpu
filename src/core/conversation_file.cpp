@@ -1,4 +1,5 @@
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_pool.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -86,9 +87,14 @@ struct AlignedFree { void operator()(uint8_t* p) const { _aligned_free(p); } };
 using Aligned = std::unique_ptr<uint8_t, AlignedFree>;
 Aligned aligned_block() { return Aligned(static_cast<uint8_t*>(_aligned_malloc(kBlock, kAlign))); }
 #else
-struct AlignedFree { void operator()(uint8_t* p) const { std::free(p); } };
+// from conv_pool (page-aligned, a 16 MiB block of the fixed pool), so the journal's blocks stay out of the heap
+static_assert(kBlock == strata::core::conv_pool::kBlock && kAlign <= strata::core::conv_pool::kPage);
+struct AlignedFree { void operator()(uint8_t* p) const { strata::core::conv_pool::release(p, kBlock); } };
 using Aligned = std::unique_ptr<uint8_t, AlignedFree>;
-Aligned aligned_block() { return Aligned(static_cast<uint8_t*>(std::aligned_alloc(kAlign, kBlock))); }
+Aligned aligned_block() {
+    try { return Aligned(static_cast<uint8_t*>(strata::core::conv_pool::alloc(kBlock))); }
+    catch (const std::bad_alloc&) { return Aligned(); }
+}
 #endif
 
 uint64_t random64() {
