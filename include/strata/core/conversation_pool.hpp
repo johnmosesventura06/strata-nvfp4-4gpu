@@ -7,8 +7,10 @@
 // RAM 16 -> 8.6 GiB, back to 15.6 after a malloc_trim.  Here:
 //   - a FIXED pool of 16 MiB blocks (STRATA_CONV_POOL_MIB, default 4096; 0 = no pool), reserved and touched up
 //     front by reserve() so its RAM is paid once, like the pinned K/V, and reused by every park and mount;
-//   - every other block of 1 MiB or more, and a 16 MiB block the pool has no spare for, mapped from the kernel
-//     and unmapped on free - an image larger than the pool costs RAM only while it exists;
+//     Any request from 1 MiB to 16 MiB takes a whole block (a per-layer K/V buffer is usually a little under
+//     16 MiB; mapping those fresh made an 18K-token park 150 -> 780 ms on page faults);
+//   - a block the pool has no spare for, and anything above 16 MiB, mapped from the kernel and unmapped on
+//     free - an image larger than the pool costs RAM only while it exists;
 //   - smaller allocations stay on operator new.
 // So the process holds the pool plus whatever images are alive this moment, never a high-water mark.
 
@@ -85,7 +87,7 @@ inline void* alloc(size_t n) {
 #ifndef _WIN32
     if (n >= kDirectMin) {
         State& s = state();
-        if (n == kBlock) {
+        if (n <= kBlock) {
             std::lock_guard<std::mutex> lk(s.mu);
             configure_locked(s);
             if (!s.free.empty()) {
@@ -96,7 +98,7 @@ inline void* alloc(size_t n) {
             }
             ++s.st.pool_misses;
         }
-        if (void* p = map_bytes(n)) {
+        if (void* p = map_bytes(n <= kBlock ? kBlock : n)) {   // block-sized, so it can join the pool on free
             std::lock_guard<std::mutex> lk(s.mu);
             ++s.st.mapped;
             return p;
@@ -115,13 +117,13 @@ inline void release(void* p, size_t n) noexcept {
         {
             std::lock_guard<std::mutex> lk(s.mu);
             configure_locked(s);
-            if (n == kBlock && s.free.size() < s.cap) {   // idle blocks never exceed the pool's size
+            if (n <= kBlock && s.free.size() < s.cap) {   // idle blocks never exceed the pool's size
                 s.free.push_back(p);
                 return;
             }
             ++s.st.unmapped;
         }
-        unmap_bytes(p, n);
+        unmap_bytes(p, n <= kBlock ? kBlock : n);
         return;
     }
 #endif
