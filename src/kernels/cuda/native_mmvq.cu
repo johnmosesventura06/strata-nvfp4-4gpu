@@ -1699,8 +1699,11 @@ __global__ void q8_0_mma_kernel(const Q80Block* __restrict__ w, const Q81Block* 
 // Chunk c of a row goes to warp c % KW; per (row, column) the blocks are added in block order within a warp and the
 // warps in warp order, so the sums depend only on the shape and KW (q8_0_mma_kw), never on the column count.
 constexpr int MMA_U2 = 4, MMA_CH_U2 = MMA_U2 * 34 / 8;   // 17 uint2 per row chunk
+// blocks per SM the registers must allow: 2 for 320-thread blocks (96 registers; 1 at the default 134 starved the
+// weight stream), 4 for <= 160 threads, 1 above 320 (more would spill)
+constexpr int mma2_minb(int kw) { return kw * WARP <= 160 ? 4 : kw * WARP <= 320 ? 2 : 1; }
 template <int NCOLS, int KW>
-__launch_bounds__(KW * WARP)
+__launch_bounds__(KW * WARP, mma2_minb(KW))
 __global__ void q8_0_mma2_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
                                  int n_in, int n_out, const Q80Block* __restrict__ w2, float* __restrict__ y2) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -1719,18 +1722,21 @@ __global__ void q8_0_mma2_kernel(const Q80Block* __restrict__ w, const Q81Block*
     const Q81Block* xs1 = x + std::size_t(c1 < NCOLS ? c1 : 0) * nb;
     // this lane's share of a chunk: elements e = lane + 32 i of the 16 x 17 uint2
     constexpr int NE = (16 * MMA_CH_U2 + WARP - 1) / WARP;   // 9
-    const uint2* src[NE];
+    // 32-bit offsets (in uint2) from the first row of the tile, not 64-bit pointers: registers set the occupancy here
+    const uint2* wt = reinterpret_cast<const uint2*>(w + std::size_t(bx) * 16 * nb);
+    const int rstride = nb * 34 / 8;                  // uint2 per row (nb % 4 == 0)
+    unsigned src[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         const int e = lane + WARP * i, row = min(e / MMA_CH_U2, 15), col = e - (e / MMA_CH_U2) * MMA_CH_U2;
-        const int rr = min(bx * 16 + row, n_out - 1);
-        src[i] = reinterpret_cast<const uint2*>(w + std::size_t(rr) * nb) + col;
+        const int rr = min(row, n_out - 1 - bx * 16);
+        src[i] = unsigned(rr * rstride + col);
     }
     uint2 bufa[NE], bufb[NE];   // two chunks in flight
     auto fetch = [&](uint2 (&buf)[NE], int ch) {
 #pragma unroll
         for (int i = 0; i < NE; ++i)
-            if (lane + WARP * i < 16 * MMA_CH_U2) buf[i] = __ldg(src[i] + std::size_t(ch) * MMA_CH_U2);
+            if (lane + WARP * i < 16 * MMA_CH_U2) buf[i] = __ldg(wt + src[i] + unsigned(ch * MMA_CH_U2));
     };
     uint2* tw = tile[warp];
     const uint16_t* th = reinterpret_cast<const uint16_t*>(tw);
@@ -1812,11 +1818,14 @@ void q8_0_mma_launch_n(const Q80Block* w, const Q81Block* x, float* y, int n_in,
                        float* y2, cudaStream_t s) {
     const unsigned grid = unsigned((n_out + 15) / 16 * (w2 ? 2 : 1));
     const int nch = n_in / 32 / MMA_U2;
-    if ((n_in / 32) % MMA_U2 == 0 && g_mma_q8_cfg == 0) {   // default: KW by shape - the most warps (<= 16) that split
-        // the row's chunks evenly with at least 2 each (a function of n_in alone, so of no column count)
+    if ((n_in / 32) % MMA_U2 == 0 && g_mma_q8_cfg == 0) {   // default: KW by shape - the fewest warps (>= 4) that split
+        // the row's chunks evenly, so each warp streams several chunks and 4 blocks fit an SM (a function of n_in
+        // alone, so of no column count; n_in 2560: 4 warps x 5 chunks, 2560 x 10240 c2 38.6 -> 36.0 us vs 10 warps)
         int kw = 4;
-        for (int c : {16, 10, 8, 5, 4})
+        for (int c : {4, 5, 8, 10, 16})
             if (nch % c == 0 && nch / c >= 2) { kw = c; break; }
+        static const int kw_force = [] { const char* v = std::getenv("STRATA_MMA_KW"); return v ? std::atoi(v) : 0; }();
+        if (kw_force == 4 || kw_force == 5 || kw_force == 8 || kw_force == 10 || kw_force == 16) kw = kw_force;
         switch (kw) {
             case 16: q8_0_mma2_kernel<NCOLS, 16><<<grid, 16 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
             case 10: q8_0_mma2_kernel<NCOLS, 10><<<grid, 10 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
