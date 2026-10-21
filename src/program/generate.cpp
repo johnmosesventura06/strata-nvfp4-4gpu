@@ -4330,6 +4330,9 @@ int main(int argc, char** argv) {
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
+    // STRATA_MTP_BATCH=1: the batched draft's lead (MtpDrafter::draft_batch) - a drafter of its own on the shared
+    // weights, 8 rows, loaded here with the slots' so the expert cache is sized around it
+    std::unique_ptr<strata::core::MtpDrafter> batch_lead;
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -4360,6 +4363,18 @@ int main(int argc, char** argv) {
                 d->set_max_drafts(1);   // the first candidate verifies one proposal per slot
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
                 slot_mtp.push_back(std::move(d));
+            }
+            const char* mb = std::getenv("STRATA_MTP_BATCH");
+            if (mb != nullptr && mb[0] == '1' && o.batch >= 2) {
+                batch_lead = std::make_unique<strata::core::MtpDrafter>();
+                if (!batch_lead->load(o.mtp, draft_geometry, *bslot_ss[0][0], strata::kernels::kVerifyMaxT, err,
+                                      o.mtp_window, &mtp)) {
+                    std::fprintf(stderr, "strata generate: the batched draft's lead: %s%s\n", err.c_str(),
+                                 vram_free_note().c_str());
+                    return 1;
+                }
+                batch_lead->set_max_drafts(1);
+                batch_lead->set_ple_session(bslot_ss[0][0].get());
             }
         }
     }
@@ -7377,6 +7392,11 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            if (batch_lead && !slot_mtp_rows.empty() &&
+                !batch_lead->bind(wt, &native_head, slot_mtp_rows[0].get(), err, &mtp)) {
+                std::fprintf(stderr, "strata serve: the batched draft's lead: %s%s\n", err.c_str(), vram_free_note().c_str());
+                return 1;
+            }
         }
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
@@ -9484,6 +9504,8 @@ int main(int argc, char** argv) {
             const Clock::time_point w1 = Clock::now();
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
             std::vector<int> keep(bs.size(), 0);
+            static const bool mtp_batch_on = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v && v[0] == '1'; }();
+            std::vector<int> draft_pend;   // window slots (t) whose draft runs batched after the emit loop
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
@@ -9523,6 +9545,7 @@ int main(int argc, char** argv) {
                     sl.p += 1;
                 }
                 if (batch_mtp && sl.active) {
+                    if (mtp_batch_on) { draft_pend.push_back(t); continue; }   // drafted together below
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
                     if (cudaMemcpy(slot_mtp_rows[(size_t) b].get(),
                                    ver.final_R_all() + (size_t) first[t] * stride,
@@ -9534,6 +9557,52 @@ int main(int argc, char** argv) {
                     }
                     sl.draft_ready = true;
                 }
+            }
+            // STRATA_MTP_BATCH=1: the live slots' drafts in one round (MtpDrafter::draft_batch), in slot order (its
+            // graphs are kept per set of slots); a set it cannot take drafts slot by slot as above
+            if (!draft_pend.empty()) {
+                std::sort(draft_pend.begin(), draft_pend.end(),
+                          [&](int x, int y) { return active[x] < active[y]; });
+                const int A = (int) draft_pend.size();
+                std::vector<strata::core::MtpDrafter*> dd((size_t) A);
+                std::vector<int32_t> dtok((size_t) 2 * A), dout((size_t) A);
+                std::vector<int64_t> dp((size_t) A);
+                std::vector<int> da((size_t) A), dw((size_t) A);
+                for (int j = 0; j < A; ++j) {
+                    const int t = draft_pend[(size_t) j], b = active[t];
+                    dd[(size_t) j] = slot_mtp[(size_t) b].get();
+                    dtok[(size_t) 2 * j] = outb[first[t]];
+                    dtok[(size_t) 2 * j + 1] = outb[first[t] + 1];
+                    dp[(size_t) j] = pos[first[t]];
+                    da[(size_t) j] = keep[b] - 1;
+                    dw[(size_t) j] = first[t];
+                }
+                const bool batched = A >= 2 && batch_lead &&
+                    strata::core::MtpDrafter::draft_batch(*batch_lead, dd.data(), A, dtok.data(), dp.data(), da.data(),
+                                                          dw.data(), ver.final_R_all(), dout.data(), err);
+                if (!batched && !err.empty()) {
+                    std::printf("ERR batch MTP (batched draft): %s\n", err.c_str());
+                    return false;
+                }
+                for (int j = 0; j < A; ++j) {
+                    const int t = draft_pend[(size_t) j], b = active[t];
+                    BSlot& sl = bs[(size_t) b];
+                    if (batched) {
+                        sl.draft[0] = dout[(size_t) j];
+                    } else {
+                        const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                        if (cudaMemcpy(slot_mtp_rows[(size_t) b].get(),
+                                       ver.final_R_all() + (size_t) first[t] * stride,
+                                       2 * stride * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess ||
+                            !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                        sl.draft.data(), err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                    }
+                    sl.draft_ready = true;
+                }
+                draft_pend.clear();
             }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());

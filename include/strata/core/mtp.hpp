@@ -92,6 +92,17 @@ public:
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
+    /// STRATA_MTP_BATCH=1 (--batch-mtp): one draft round for A >= 2 slots' drafters at once, run on `lead`'s scratch
+    /// and stream (a drafter of its own, loaded with max_t 8 on the shared weights; never one of the slots').  The front (embedding, fc, hyper-connection, K/V) runs over the slots' window rows together, in
+    /// groups of max_t / 2 slots, each slot's K/V appended to its own cache; the rest (attention over each slot's own
+    /// cache, the MLP, the head) over one row per slot.  Slot j: window rows win_rows[j], +1 of `window_R_all`,
+    /// tokens[2j], tokens[2j+1] (the window's argmaxes there), cell p[j], accepted row a[j]; its one draft -> drafts[j].
+    /// Every slot drafts one token (set_max_drafts(1)), greedy (no coupled sampling).  False with `err` empty: not
+    /// eligible (the caller drafts slot by slot); with `err`: a CUDA failure.
+    static bool draft_batch(MtpDrafter& lead, MtpDrafter* const* ds, int A, const int32_t* tokens, const int64_t* p,
+                            const int* a, const int* win_rows, const float* window_R_all, int32_t* drafts,
+                            std::string& err);
+
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
@@ -157,10 +168,26 @@ private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
-    bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
+    /// draft_batch: `toks` (default tok_) are the T rows' tokens; `kv_slots` (default: this) row pair j's drafter,
+    /// whose cache gets rows 2j and 2j + 1.
+    bool record_front(int T, int row0, cudaStream_t cs, std::string& err, const int32_t* toks = nullptr,
+                      MtpDrafter* const* kv_slots = nullptr);
     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
     bool record_rest(int step_row, cudaStream_t cs, std::string& err);
+    /// The rest for T rows at step rows [step_row, +T) on rows 0.. of R (residual, updated) and inj_prev (the
+    /// attention hyper-connection's injection), their q8_1 rows in xq_; row t attends over att[t]'s cache
+    /// (att null: this drafter's, T must be 1).  record_rest = record_rest_rows(1, step_row, R_, inj_, nullptr).
+    bool record_rest_rows(int T, int step_row, float* R, const float* inj_prev, MtpDrafter* const* att,
+                          cudaStream_t cs, std::string& err);
+    // draft_batch: the gathered rest rows, the batch's tokens and gather indices, its graphs per set of drafters
+    bool batch_buffers(std::string& err);
+    float *bR_ = nullptr, *binj_ = nullptr, *bmixed_ = nullptr;
+    int32_t *btok_ = nullptr, *bidx_ = nullptr;
+    const float* batch_src_ = nullptr;
+    bool batch_bad_[17] = {};   ///< a batch size whose capture failed: its rounds draft slot by slot
+    cudaGraphExec_t bexec_[9] = {};                ///< draft_batch's graph per number of slots (on the lead)
+    std::vector<const MtpDrafter*> bkey_[9];       ///< the drafters each was last captured for
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
