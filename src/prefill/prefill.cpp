@@ -2214,6 +2214,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+    const bool ple_override = ple_override_;   // pair mode's second chunk: the two tokens before it, from the caller
+    if (ple_override) { prev[0] = ple_a_; prev[1] = ple_b_; }
+    ple_override_ = false;
+    // pair mode (set_pair): this run's chains; an early return releases its own, so the next chunk never waits forever
+    PairChain* const pair_wait = pair_wait_;
+    PairChain* const pair_signal = pair_signal_;
+    pair_wait_ = pair_signal_ = nullptr;
+    struct PairRelease {
+        PairChain* c;
+        ~PairRelease() { if (c) c->issued.store(INT64_MAX, std::memory_order_release); }
+    } pair_release{pair_signal};
     // layer split: a prompt of one chunk runs the stages one after the other, so the next stage's GPU idles while
     // this one reads; it streams and computes a share of this stage's experts then (set_stage_helper), in the
     // place of a --peer-device peer, and gives the stage back its own buffers when the run ends
@@ -2640,6 +2651,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
+            if (pair_wait) {   // pair mode: the previous chunk's attention half of this layer comes first
+                while (pair_wait->issued.load(std::memory_order_acquire) < l) std::this_thread::yield();
+                if (pair_wait->issued.load(std::memory_order_acquire) != INT64_MAX &&
+                    cudaStreamWaitEvent(cs, (cudaEvent_t) pair_wait->done[(size_t) l], 0) != cudaSuccess) {
+                    err = "prefill: the pair's wait at layer " + std::to_string(l);
+                    return false;
+                }
+            }
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
@@ -2697,6 +2716,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 stats_.ms_ple += ms_since(tp);
             }
             for (int half = 0; half < 2; ++half) {
+                if (half == 1 && pair_signal) {   // pair mode: this chunk's attention half of layer l is enqueued
+                    if (cudaEventRecord((cudaEvent_t) pair_signal->done[(size_t) l], cs) != cudaSuccess) {
+                        err = "prefill: the pair's record at layer " + std::to_string(l);
+                        return false;
+                    }
+                    pair_signal->issued.store(l, std::memory_order_release);
+                }
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -4460,8 +4486,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
-    ss.ple_prev[0] = prev[0];
-    ss.ple_prev[1] = prev[1];
+    if (!ple_override) {   // a pair's second chunk leaves them to its caller
+        ss.ple_prev[0] = prev[0];
+        ss.ple_prev[1] = prev[1];
+    }
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {

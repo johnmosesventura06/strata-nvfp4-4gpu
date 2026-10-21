@@ -6642,6 +6642,14 @@ int main(int argc, char** argv) {
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
+        // STRATA_PF_PAIR=1 (batch serve on one GPU stage): a second prompt path reads the chunk after sp's at the same
+        // time (Prefill::PairChain) - sp's loan is doubled below and each takes half of it
+        strata::prefill::Prefill sp2;
+        bool sp2_ok = false;
+        void* sp2_borrow = nullptr;
+        uint64_t sp2_bytes = 0;
+        cudaStream_t sp2_cs = nullptr;
+        static const bool pf_pair_env = [] { const char* v = std::getenv("STRATA_PF_PAIR"); return v && v[0] == '1'; }();
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
         // F10-share (the 4-GPU lane): an explicit STRATA_PREFILL_CPU_SHARE also wires the pool when the engine
@@ -6887,6 +6895,21 @@ int main(int argc, char** argv) {
                 lend_first = pf_parts[0].first;
                 borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
                 borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+                if (pf_pair_env && pf_parts.size() == 1 && lend_first >= 0) {   // pair mode: twice the loan, half each
+                    const int32_t one = lend_first;
+                    const int64_t two = (int64_t) xcache.slots() - 2 * ((int64_t) xcache.slots() - one);
+                    if (two >= 0) {
+                        lend_first = (int32_t) two;
+                        pf_parts[0].first = pf_parts[0].first_now = (int32_t) two;
+                        borrow = xcache.device_slot(lend_first);
+                        borrow_bytes = part_bytes(pf_parts[0], lend_first) - part_bytes(pf_parts[0], one);   // sp: [two, one)
+                        sp2_borrow = xcache.device_slot(one);
+                        sp2_bytes = part_bytes(pf_parts[0], one);                                          // sp2: [one, end)
+                        std::fprintf(stderr, "strata serve: STRATA_PF_PAIR: the loan doubled to %lld slots for two "
+                                             "%lld-token prompt paths\n", (long long) (xcache.slots() - lend_first),
+                                     (long long) o.prefill_chunk);
+                    }
+                }
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             } else if (pf_parts.size() > 1) {
@@ -6948,6 +6971,16 @@ int main(int argc, char** argv) {
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
+            if (sp2_borrow != nullptr && stages.empty()) {
+                if (sp2_cs == nullptr) cudaStreamCreateWithFlags(&sp2_cs, cudaStreamNonBlocking);
+                std::string e2;
+                sp2_ok = sp2.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, (void*) sp2_cs, e2,
+                                  sp2_borrow, sp2_bytes);
+                if (sp2_ok) std::fprintf(stderr, "strata serve: STRATA_PF_PAIR: a second prompt path reads the next chunk "
+                                                 "beside the first\n");
+                else std::fprintf(stderr, "strata serve: STRATA_PF_PAIR: the second prompt path does not fit (%s): off\n",
+                                  e2.c_str());
+            }
             return 0;
         };
         static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
@@ -7007,6 +7040,8 @@ int main(int argc, char** argv) {
                 sp.reset();
                 (void) cudaGetLastError();
                 o.prefill_chunk = next;
+                sp2_borrow = nullptr;            // STRATA_PF_PAIR: the retry's loan is a single one
+                sp2_ok = false;
                 if (any_loan) {                  // smaller loans for the smaller chunk
                     for (PfPart& p : pf_parts)
                         if (p.first >= 0) {
@@ -7034,6 +7069,12 @@ int main(int argc, char** argv) {
             if (!sp.set_peers(parr, n_peers, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                 err.clear();
+            }
+            if (sp2_ok && !sp2.set_peers(parr, n_peers, rows, err)) {   // a pair whose second path has no tiers: off
+                std::fprintf(stderr, "strata serve: STRATA_PF_PAIR: the second prompt path's tier buffers: %s - off\n",
+                             err.c_str());
+                err.clear();
+                sp2_ok = false;
             }
         }
         // a layer split: a one-chunk prompt runs the stages one after the other, so each stage's prompt path gets the
@@ -8201,11 +8242,13 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+        // each prompt path's own on_chunk (its draft_kv scratch); STRATA_PF_PAIR runs the two in chunk order
+        auto make_on_chunk = [&](strata::prefill::Prefill& P) {
+          return [&, pp = &P](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = use_mtp && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            const bool batched = use_mtp && !multi_gpu && pp->draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
@@ -8246,7 +8289,10 @@ int main(int argc, char** argv) {
                 if (tail_checkpoint) pp_tail_saved = true;
             }
             return true;
+          };
         };
+        sp.on_chunk = make_on_chunk(sp);
+        if (sp2_ok) sp2.on_chunk = make_on_chunk(sp2);
         if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
@@ -9176,6 +9222,7 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
+        sp2.should_stop = [&] { return stop_req.load(); };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
@@ -11096,11 +11143,61 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch: the slots decode beside this prompt read (STRATA_BATCH_CONCURRENT)\n");
                     ++il_parts;
                 }
+                // STRATA_PF_PAIR: chunks [q, r) and [r, r2) at once - never across a checkpoint (on_chunk saves the
+                // session's state at r, which the second chunk would already be changing) and text only
+                auto pair_ok = [&](int64_t q0, int64_t r0, int64_t r1) {
+                    if (!sp2_ok || r0 >= b0 || r1 <= r0 || r0 < 2 || sp.embd_rows != nullptr || !stages.empty()) return false;
+                    const bool periodic = o.prompt_cache_every > 0 && r0 >= pp_next_check;
+                    const bool tail = o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 && !multi_gpu &&
+                                      !pp_tail_saved && pp_total - r0 > std::max<int64_t>(1, o.short_read) &&
+                                      pp_total - r0 <= r0 - q0;
+                    return !periodic && !tail;
+                };
+                auto run_pair = [&](int64_t q0, int64_t r0, int64_t r1, std::string& pe) -> bool {
+                    static strata::prefill::Prefill::PairChain chain;   // sp's layers; sp2 waits on them
+                    if (chain.done.empty()) {
+                        chain.done.assign((size_t) g.n_layers, nullptr);
+                        for (auto& ev : chain.done) {
+                            cudaEvent_t x = nullptr;
+                            cudaEventCreateWithFlags(&x, cudaEventDisableTiming);
+                            ev = (void*) x;
+                        }
+                    }
+                    chain.issued.store(-1, std::memory_order_release);
+                    sp.set_pair(nullptr, &chain);
+                    sp2.set_pair(&chain, nullptr);
+                    sp2.set_ple_prev((int32_t) ids[(size_t) (r0 - 2)], (int32_t) ids[(size_t) (r0 - 1)]);
+                    std::atomic<int> first{0};   // 1: sp's run (and its on_chunk) is done, 2: it failed
+                    auto own = sp2.on_chunk;
+                    sp2.on_chunk = [&](const float* R, int64_t T2, int64_t p02, std::string& e2) -> bool {
+                        while (first.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+                        if (first.load(std::memory_order_acquire) != 1) { e2 = "the pair's first chunk failed"; return false; }
+                        return own(R, T2, p02, e2);
+                    };
+                    std::string e2;
+                    bool ok2 = false;
+                    std::thread second([&] { ok2 = sp2.run(ids.data() + r0, r1 - r0, r0, e2); });
+                    const bool ok1 = sp.run(ids.data() + q0, r0 - q0, q0, pe);
+                    first.store(ok1 ? 1 : 2, std::memory_order_release);
+                    second.join();
+                    sp2.on_chunk = own;
+                    if (!ok1) return false;
+                    if (!ok2) { pe = e2; return false; }
+                    ss.ple_prev[0] = (int32_t) ids[(size_t) (r1 - 2)];   // the second chunk left them to us
+                    ss.ple_prev[1] = (int32_t) ids[(size_t) (r1 - 1)];
+                    return true;
+                };
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + C);
                     const auto tq = Clock::now();
-                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
-                    q = r;
+                    const int64_t r2 = std::min(b0, r + C);
+                    if (pair_ok(q, r, r2)) {
+                        if (!run_pair(q, r, r2, e)) return false;
+                        q = r2;
+                    } else {
+                        if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                        q = r;
+                    }
                     if (q >= b0) continue;
                     int ys = -1;
                     {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read

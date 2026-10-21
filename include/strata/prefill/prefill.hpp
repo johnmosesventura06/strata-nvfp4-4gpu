@@ -17,6 +17,7 @@
 #include "strata/core/weights.hpp"
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <future>
 #include <memory>
@@ -130,6 +131,25 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
+    /// PAIR MODE (serve, STRATA_PF_PAIR): two prompt paths read two consecutive chunks at once on their own streams
+    /// and threads, so one chunk's attention runs on the primary while the other's experts are on the tiers.  A chunk's
+    /// layer l reads what the chunk before wrote at layer l - the recurrent state, the K/V and its host copy, the
+    /// indexer, the PLE history - all of it written by the time that chunk's ATTENTION half of layer l ends; its MoE
+    /// half writes nothing the next chunk reads.  A PairChain carries that ordering: one event per layer, recorded
+    /// after the attention half, and the host count of the layers recorded so far (a GPU wait enqueued before the
+    /// record would wait on a stale one).
+    struct PairChain {
+        std::vector<void*> done;          ///< cudaEvent_t per layer (by layer index), created by the caller
+        std::atomic<int64_t> issued{-1};  ///< the last layer whose `done` has been recorded; INT64_MAX: released
+    };
+    /// Before `run` (one run, then cleared): `wait` - the previous chunk's chain, which this run's layer l waits on
+    /// before it starts; `signal` - this run's own chain.  Either may be null.  A run that ends early (an error)
+    /// releases its chain, so a successor never waits forever (its result is then discarded by the caller).
+    void set_pair(PairChain* wait, PairChain* signal) { pair_wait_ = wait; pair_signal_ = signal; }
+    /// Before `run` (one run): the two tokens before pos0 for the PLE n-grams instead of ss.ple_prev, which the run then
+    /// leaves as it is - a pair's second chunk cannot read them from the session (the first sets them when it ends).
+    void set_ple_prev(int32_t a, int32_t b) { ple_override_ = true; ple_a_ = a; ple_b_ = b; }
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
@@ -216,6 +236,11 @@ private:
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+
+    PairChain* pair_wait_ = nullptr;
+    PairChain* pair_signal_ = nullptr;
+    bool ple_override_ = false;
+    int32_t ple_a_ = -1, ple_b_ = -1;
 
     std::string next_err_;
     std::future<bool> next_run_;
